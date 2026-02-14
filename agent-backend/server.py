@@ -12,6 +12,12 @@ sys.path.insert(0, ".")
 from benchwarmer.algorithms.base import AlgorithmWrapper
 from benchwarmer.config import BenchmarkConfig, GeneratorConfig, InstanceConfig
 from benchwarmer.engine.runner import BenchmarkRunner
+from benchwarmer.agents.intake import IntakeAgent
+from dotenv import load_dotenv
+import os
+
+# Load environment variables
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
@@ -81,6 +87,24 @@ class RandomVertexCover(AlgorithmWrapper):
                 cover.append(u)
                 covered.add(u)
         return {"solution": {"vertices": cover}, "metadata": {"strategy": "random"}}
+
+class RandomMaxCut(AlgorithmWrapper):
+    """Randomly partitions vertices into two sets (0 and 1)."""
+    name = "random_max_cut"
+
+    def solve(self, instance: dict, timeout: float = 60.0) -> dict:
+        import random
+        partition = []
+        n_nodes = len(instance["nodes"])
+        # If nodes are just a count, we assume 0..n-1.
+        # If instance["nodes"] is a list of metadata, we just need the count.
+        # But wait, instance["nodes"] in Benchwarmer is usually a list of dicts or just indices?
+        # Let's check ErdosRenyiGenerator. usually it's list of ints.
+        # Actually, let's just use the length.
+        
+        partition = [random.choice([0, 1]) for _ in range(n_nodes)]
+        
+        return {"solution": {"partition": partition}, "metadata": {"strategy": "random"}}
 
 # ─── Helper Functions ────────────────────────────────────────────────────────—
 
@@ -166,12 +190,53 @@ def transform_results(df: pd.DataFrame) -> BenchmarkResponse:
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
 
+# ─── Endpoints ────────────────────────────────────────────────────────────────
+
 @app.post("/api/benchmark", response_model=BenchmarkResponse)
 async def run_benchmark_endpoint(request: BenchmarkRequest):
     try:
-        df = run_demo_benchmark(request.query)
+        logging.info(f"Processing query: {request.query!r}")  # Use repr to see whitespace/empty
+        
+        # 1. Initialize Intake Agent
+        #    It will automatically look for ANTHROPIC_API_KEY in os.environ
+        agent = IntakeAgent()
+        
+        # 2. Run Intake Agent (non-interactive mode for API)
+        #    This uses Claude to generate the BenchmarkConfig
+        config = agent.run(request.query, interactive=False)
+        logging.info(f"Generated config: {config}")
+
+        # 3. Initialize Runner
+        runner = BenchmarkRunner(config)
+        
+        # 4. Register Algorithms
+        #    In a full version, we'd dynamically load these based on the problem class.
+        #    For now, we register our "universal" baselines + specific ones if needed.
+        #    But our demo algorithms (Greedy/Random Vertex Cover) only work for 
+        #    Minimum Vertex Cover. 
+        #    
+        #    TODO: Add a proper registry or factory.
+        #    For this step, we'll just register the VC algos if the problem is MVC,
+        #    or generic ones if we had them.
+        
+        if config.problem_class == "minimum_vertex_cover":
+            runner.register_algorithm(GreedyVertexCover())
+            runner.register_algorithm(RandomVertexCover())
+        elif config.problem_class == "maximum_cut":
+            # Use the new RandomMaxCut
+            runner.register_algorithm(RandomMaxCut())
+        else:
+             logging.warning(f"Unknown problem class {config.problem_class}, attempting with available algos.")
+             runner.register_algorithm(GreedyVertexCover())
+             runner.register_algorithm(RandomVertexCover())
+
+        # 5. Run Benchmark
+        df = runner.run()
+        
+        # 6. Transform Results
         response = transform_results(df)
         return response
+
     except Exception as e:
         logging.error(f"Error running benchmark: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

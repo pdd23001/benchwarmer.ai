@@ -185,6 +185,7 @@ class IntakeAgent:
         messages: list[dict[str, Any]] = [
             {"role": "user", "content": user_description},
         ]
+        logger.info(f"IntakeAgent run() called with: {user_description!r}")  # DEBUG LOG
 
         max_turns = 10  # safety rail
         for turn in range(max_turns):
@@ -231,11 +232,11 @@ class IntakeAgent:
                 # Try to extract a JSON config from the response
                 config = self._try_parse_config(text)
                 if config is not None:
-                    print(f"\n🤖 Intake Agent:\n{text}")
+                    print(f"\n[Intake Agent]:\n{text}")
                     return config
 
                 # No config yet — agent is asking a clarifying question
-                print(f"\n🤖 Intake Agent:\n{text}")
+                print(f"\n[Intake Agent]:\n{text}")
 
                 if not interactive:
                     raise RuntimeError(
@@ -244,7 +245,7 @@ class IntakeAgent:
                     )
 
                 while True:
-                    user_reply = input("\n📝 Your answer: ").strip()
+                    user_reply = input("\n[Your answer]: ").strip()
                     if user_reply:
                         break
                     print("   (Please type a response, or type 'defaults' to let the agent decide)")
