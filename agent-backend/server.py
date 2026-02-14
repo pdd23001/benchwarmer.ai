@@ -4,7 +4,7 @@ import sys
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 # Ensure we can import from benchwarmer package
 sys.path.insert(0, ".")
@@ -28,6 +28,9 @@ app = FastAPI()
 
 class BenchmarkRequest(BaseModel):
     query: str
+    execution_mode: str = "local"  # "local" or "modal"
+    modal_token_id: Optional[str] = None
+    modal_token_secret: Optional[str] = None
 
 class SeriesData(BaseModel):
     name: str
@@ -231,7 +234,11 @@ async def run_benchmark_endpoint(request: BenchmarkRequest):
              runner.register_algorithm(RandomVertexCover())
 
         # 5. Run Benchmark
-        df = runner.run()
+        df = runner.run(
+            execution_mode=request.execution_mode,
+            modal_token_id=request.modal_token_id,
+            modal_token_secret=request.modal_token_secret,
+        )
         
         # 6. Transform Results
         response = transform_results(df)

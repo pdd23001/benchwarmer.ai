@@ -222,11 +222,16 @@ def execute_algorithm_code(
             "traceback": "",
         }
 
+    # Attach source code for Modal serialization (inspect.getsource fails
+    # on classes created via exec, so we preserve the original string).
+    algo_instance._source_code = code
+
     return {
         "success": True,
         "algorithm": algo_instance,
         "name": algo_instance.name,
         "smoke_result": result,
+        "code": code,  # preserve for Modal serialization
     }
 
 

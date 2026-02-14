@@ -36,6 +36,7 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="Benchwarmer.AI")
     parser.add_argument("--custom", "-c", type=str, help="Path to custom algorithm file to benchmark against.")
+    parser.add_argument("--mode", "-m", type=str, default="local", choices=["local", "modal"], help="Execution mode: 'local' (default) or 'modal' (remote sandbox).")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -109,8 +110,8 @@ def main() -> None:
     for algo in algorithms:
         runner.register_algorithm(algo)
 
-    print(f"\n🚀 Running benchmark…")
-    df = runner.run()
+    print(f"\n🚀 Running benchmark (mode={args.mode})…")
+    df = runner.run(execution_mode=args.mode)
 
     print(f"\n✅ Benchmark complete — {len(df)} result rows")
     print("-" * 60)
@@ -773,6 +774,16 @@ def _print_summary(df) -> None:
     success_df = df[df["status"] == "success"]
     if success_df.empty:
         print("⚠️  No successful runs to summarize.")
+        # Show error breakdown so user can debug
+        error_df = df[df["status"] != "success"]
+        if not error_df.empty:
+            print("\n❌ Error breakdown:")
+            for algo, group in error_df.groupby("algorithm_name"):
+                errors = group["error_message"].value_counts()
+                print(f"\n   {algo}:")
+                for msg, count in errors.items():
+                    print(f"     [{count}×] {msg[:200]}")
+            print()
         return
 
     summary = (

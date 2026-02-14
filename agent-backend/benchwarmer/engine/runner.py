@@ -118,7 +118,13 @@ class BenchmarkRunner:
         logger.info("Generated %d instances", len(instances))
         return instances
 
-    def run(self, parallel: bool = False) -> pd.DataFrame:
+    def run(
+        self,
+        parallel: bool = False,
+        execution_mode: str = "local",
+        modal_token_id: str | None = None,
+        modal_token_secret: str | None = None,
+    ) -> pd.DataFrame:
         """
         Execute the full benchmark and return a results DataFrame.
 
@@ -128,7 +134,29 @@ class BenchmarkRunner:
             If True, run each (algorithm × instance × run) in a separate
             process.  Defaults to False (sequential) for simplicity and
             easier debugging.
+        execution_mode : str
+            "local" (default) — run on this machine.
+            "modal" — run concurrently on Modal sandboxes.
+        modal_token_id : str | None
+            Optional Modal token ID for BYOK (per-request auth).
+        modal_token_secret : str | None
+            Optional Modal token secret for BYOK (per-request auth).
         """
+        # ── Modal mode: delegate to ModalRunner ──────────────────────
+        if execution_mode == "modal":
+            import asyncio
+            from benchwarmer.engine.modal_runner import ModalRunner
+
+            logger.info("Using Modal sandbox execution mode")
+            modal_runner = ModalRunner(
+                self.config,
+                modal_token_id=modal_token_id,
+                modal_token_secret=modal_token_secret,
+            )
+            for algo in self.algorithms:
+                modal_runner.register_algorithm(algo)
+            modal_runner._instances = self._instances
+            return asyncio.run(modal_runner.run())
         if not self.algorithms:
             raise RuntimeError("No algorithms registered. Call register_algorithm() first.")
 
