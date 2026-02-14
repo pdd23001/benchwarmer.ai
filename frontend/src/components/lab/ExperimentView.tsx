@@ -32,43 +32,35 @@ export function ExperimentView() {
         setLogs([]);
         setResults(null);
 
-        // Mock Simulation
+        // Clear existing logs
         addLog("Analyzing request...", "info");
-        await delay(1000);
-        addLog(`Identified goal: Benchmark ${query}`, "success");
-        await delay(800);
-        addLog("Searching for algorithm implementations...", "info");
-        await delay(1200);
-        addLog("Generating Python benchmark harness...", "info");
-        await delay(1000);
-        addLog("Sending code to Modal sandbox...", "info");
 
-        // Simulate running
-        for (let n of [10, 100, 1000, 10000]) {
-            await delay(500);
-            addLog(`Running benchmark for N=${n}...`, "info");
+        try {
+            const response = await fetch("/api/python/benchmark", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({ query }),
+            });
+
+            if (!response.ok) {
+                throw new Error(`Error: ${response.statusText}`);
+            }
+
+            const data = await response.json();
+
+            // Transform backend response to match chart needs if necessary, 
+            // but our backend logic aligns with the component props.
+            setResults(data);
+            setStatus("complete");
+            addLog("Benchmark complete!", "success");
+
+        } catch (error) {
+            console.error(error);
+            addLog(error instanceof Error ? error.message : "An error occurred", "error");
+            setStatus("idle"); // or 'error' state if we had one
         }
-
-        addLog("Processing results...", "success");
-        await delay(500);
-
-        // Mock Results
-        setResults({
-            title: "Dijkstra vs A* Performance",
-            xLabel: "Grid Size (N)",
-            yLabel: "Time (ms)",
-            series: [
-                { name: "Dijkstra", color: "#ef4444", dataKey: "dijkstra" },
-                { name: "A*", color: "#3b82f6", dataKey: "astar" }
-            ],
-            data: [
-                { x: 10, dijkstra: 0.5, astar: 0.2 },
-                { x: 100, dijkstra: 5.2, astar: 1.1 },
-                { x: 1000, dijkstra: 45.0, astar: 12.5 },
-                { x: 10000, dijkstra: 420.0, astar: 110.0 },
-            ]
-        });
-        setStatus("complete");
     };
 
     return (
