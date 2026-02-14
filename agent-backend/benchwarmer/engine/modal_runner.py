@@ -26,135 +26,17 @@ from benchwarmer.problem_classes.registry import get_problem_class
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# The worker script that runs INSIDE each Modal sandbox.
-# It is completely self-contained — no imports from benchwarmer.
-# ---------------------------------------------------------------------------
-
-WORKER_SCRIPT = textwrap.dedent('''\
-import json
-import sys
-import time
-import tracemalloc
-import traceback
-
-def main():
-    # Read inputs from files written into the sandbox
-    with open("/tmp/instance.json", "r") as f:
-        instance = json.load(f)
-    with open("/tmp/algo_source.py", "r") as f:
-        algo_source = f.read()
-    with open("/tmp/run_config.json", "r") as f:
-        run_config = json.load(f)
-
-    timeout = run_config.get("timeout", 60.0)
-
-    # Execute the algorithm source to get the class
-    namespace = {}
-    try:
-        exec(algo_source, namespace)
-    except Exception as e:
-        result = {
-            "solution": None,
-            "wall_time": 0.0,
-            "peak_memory_mb": 0.0,
-            "status": "error",
-            "error": f"Failed to load algorithm: {e}",
-        }
-        print("__RESULT__" + json.dumps(result))
-        return
-
-    # Find the algorithm class (look for classes with a 'solve' method)
-    # Skip the AlgorithmWrapper base class stub — we want the SUBCLASS.
-    algo_class = None
-    for name, obj in namespace.items():
-        if (isinstance(obj, type)
-            and hasattr(obj, "solve")
-            and name != "ABC"
-            and name != "AlgorithmWrapper"
-            and not name.startswith("_")):
-            algo_class = obj
-            break
-
-    if algo_class is None:
-        result = {
-            "solution": None,
-            "wall_time": 0.0,
-            "peak_memory_mb": 0.0,
-            "status": "error",
-            "error": "No algorithm class with solve() found in source",
-        }
-        print("__RESULT__" + json.dumps(result))
-        return
-
-    # Instantiate and run
-    try:
-        algo_instance = algo_class()
-    except Exception as e:
-        result = {
-            "solution": None,
-            "wall_time": 0.0,
-            "peak_memory_mb": 0.0,
-            "status": "error",
-            "error": f"Failed to instantiate algorithm: {e}",
-        }
-        print("__RESULT__" + json.dumps(result))
-        return
-
-    tracemalloc.start()
-    t0 = time.perf_counter()
-    try:
-        solution = algo_instance.solve(instance, timeout=timeout)
-        wall_time = time.perf_counter() - t0
-        _, peak_mem = tracemalloc.get_traced_memory()
-        tracemalloc.stop()
-        result = {
-            "solution": solution,
-            "wall_time": wall_time,
-            "peak_memory_mb": peak_mem / (1024 * 1024),
-            "status": "success",
-            "error": "",
-        }
-    except Exception as e:
-        wall_time = time.perf_counter() - t0
-        try:
-            _, peak_mem = tracemalloc.get_traced_memory()
-            tracemalloc.stop()
-        except Exception:
-            peak_mem = 0
-        result = {
-            "solution": None,
-            "wall_time": wall_time,
-            "peak_memory_mb": peak_mem / (1024 * 1024),
-            "status": "error",
-            "error": str(e),
-        }
-
-    print("__RESULT__" + json.dumps(result))
-
-if __name__ == "__main__":
-    main()
-''')
+# Worker script is shared with modal_sandbox.py
+from benchwarmer.utils.modal_sandbox import BENCHMARK_WORKER_SCRIPT as WORKER_SCRIPT
 
 # ---------------------------------------------------------------------------
 # Modal image definition (lazy — only built when needed)
 # ---------------------------------------------------------------------------
 
-_modal_image = None
-
-
 def _get_modal_image():
     """Build (or reuse) the Modal image with scientific deps pre-installed."""
-    global _modal_image
-    if _modal_image is not None:
-        return _modal_image
-
-    import modal
-    _modal_image = (
-        modal.Image.debian_slim(python_version="3.12")
-        .pip_install("networkx", "numpy", "pandas", "scipy", "cvxpy")
-    )
-    return _modal_image
+    from benchwarmer.utils.modal_sandbox import get_modal_image
+    return get_modal_image()
 
 
 # ---------------------------------------------------------------------------
@@ -169,66 +51,25 @@ def _get_algo_source(algo) -> str:
     the source is stored on the instance as `_source_code`.
     For file-backed classes, we use inspect.getsource().
     """
+    from benchwarmer.utils.modal_sandbox import wrap_algo_source
+
     cls = type(algo)
 
     # 1) Check for stored source (dynamically created via exec)
     if hasattr(algo, "_source_code"):
-        source = algo._source_code
-    else:
-        # 2) Fall back to inspect for file-backed classes
-        try:
-            source = inspect.getsource(cls)
-        except (OSError, TypeError):
-            raise ValueError(
-                f"Cannot extract source for {cls.__name__}. "
-                "Modal mode requires algorithm classes whose source is inspectable "
-                "or created via the Implementation Agent."
-            )
+        return wrap_algo_source(algo._source_code)
 
-    # Prepend common imports the algorithm might need
-    # (must match what algorithm_sandbox.py provides locally)
-    preamble = textwrap.dedent("""\
-    import random
-    import math
-    import itertools
-    import collections
-    import heapq
-    import functools
-    import copy
-    from abc import ABC, abstractmethod
-    from collections import defaultdict, deque, Counter
-    from typing import Any, Optional
-
-    inf = float("inf")
-
+    # 2) Fall back to inspect for file-backed classes
     try:
-        import networkx as nx
-    except ImportError:
-        pass
-    try:
-        import numpy as np
-    except ImportError:
-        pass
-    try:
-        import scipy
-        from scipy import optimize, sparse
-    except ImportError:
-        pass
-    try:
-        import cvxpy as cp
-    except ImportError:
-        pass
-    """)
+        source = inspect.getsource(cls)
+    except (OSError, TypeError):
+        raise ValueError(
+            f"Cannot extract source for {cls.__name__}. "
+            "Modal mode requires algorithm classes whose source is inspectable "
+            "or created via the Implementation Agent."
+        )
 
-    # Include the ABC base class stub so the algo can inherit from it
-    base_stub = textwrap.dedent("""\
-    class AlgorithmWrapper:
-        name = "unnamed"
-        def solve(self, instance, timeout=60.0):
-            raise NotImplementedError
-    """)
-
-    return preamble + "\n" + base_stub + "\n" + source
+    return wrap_algo_source(source)
 
 
 # ---------------------------------------------------------------------------
@@ -253,10 +94,12 @@ class ModalRunner:
         config: BenchmarkConfig,
         modal_token_id: str | None = None,
         modal_token_secret: str | None = None,
+        sandbox_pool=None,
     ) -> None:
         self.config = config
         self.algorithms: list[Any] = []
         self._instances: list[dict] = []
+        self._pool = sandbox_pool  # Reuse dev sandboxes if provided
 
         # BYOK: if the caller provides Modal credentials, inject them
         # into the environment so the Modal SDK picks them up.
@@ -328,6 +171,15 @@ class ModalRunner:
         # Build one task per algorithm (each runs all instances × runs)
         tasks = []
         for algo in self.algorithms:
+            # Check if sandbox pool has an existing sandbox for this algo
+            existing_sb = None
+            if self._pool is not None:
+                existing_sb = self._pool.get_sandbox(algo.name)
+                if existing_sb:
+                    logger.info(
+                        "Reusing development sandbox for '%s'", algo.name
+                    )
+
             tasks.append(
                 self._run_algorithm_in_sandbox(
                     algo_name=algo.name,
@@ -335,6 +187,7 @@ class ModalRunner:
                     instances=self._instances,
                     runs=runs,
                     timeout=timeout,
+                    existing_sandbox=existing_sb,
                 )
             )
 
@@ -417,45 +270,49 @@ class ModalRunner:
         instances: list[dict],
         runs: int,
         timeout: float,
+        existing_sandbox=None,
     ) -> list[tuple[dict, dict, int]]:
         """
         Run ALL instances × runs for a single algorithm inside ONE sandbox.
 
+        If existing_sandbox is provided (from SandboxPool), reuse it.
+        Otherwise create a new ephemeral sandbox.
+
         Returns a list of (raw_result, instance, run_index) tuples.
         """
-        import modal
+        owns_sandbox = existing_sandbox is None
 
-        image = _get_modal_image()
-        app = await modal.App.lookup.aio("benchwarmer-runner", create_if_missing=True)
+        if owns_sandbox:
+            import modal
+            image = _get_modal_image()
+            app = await modal.App.lookup.aio("benchwarmer-runner", create_if_missing=True)
 
-        # Total time budget: (instances × runs × timeout) + grace
-        total_timeout = int(len(instances) * runs * timeout) + 120
-
-        # Create sandbox with a keep-alive entrypoint
-        sb = await modal.Sandbox.create.aio(
-            "sleep", "infinity",
-            image=image,
-            timeout=total_timeout,
-            app=app,
-        )
+            total_timeout = int(len(instances) * runs * timeout) + 120
+            sb = await modal.Sandbox.create.aio(
+                "sleep", "infinity",
+                image=image,
+                timeout=total_timeout,
+                app=app,
+            )
+        else:
+            sb = existing_sandbox
 
         results: list[tuple[dict, dict, int]] = []
 
         try:
-            # Write the worker script (once)
-            async with await sb.open.aio("/tmp/worker.py", "w") as f:
-                await f.write.aio(WORKER_SCRIPT)
-
-            # Write the algorithm source (once)
-            async with await sb.open.aio("/tmp/algo_source.py", "w") as f:
-                await f.write.aio(algo_source)
+            if owns_sandbox:
+                # Fresh sandbox — write worker script + algo source
+                async with await sb.open.aio("/tmp/worker.py", "w") as f:
+                    await f.write.aio(WORKER_SCRIPT)
+                async with await sb.open.aio("/tmp/algo_source.py", "w") as f:
+                    await f.write.aio(algo_source)
+            # else: pool sandbox already has worker.py + algo_source.py
 
             logger.info(
                 "Sandbox for '%s' ready — running %d instance(s) × %d run(s)",
                 algo_name, len(instances), runs,
             )
 
-            # Run each instance × run sequentially inside this sandbox
             for inst in instances:
                 for run_idx in range(runs):
                     raw = await self._exec_single_run(
@@ -465,7 +322,6 @@ class ModalRunner:
 
         except Exception as exc:
             logger.error("Sandbox for '%s' failed: %s", algo_name, exc)
-            # Fill remaining results with errors
             done = len(results)
             total = len(instances) * runs
             for idx in range(done, total):
@@ -484,10 +340,12 @@ class ModalRunner:
                     run_idx,
                 ))
         finally:
-            try:
-                await sb.terminate.aio()
-            except Exception:
-                pass
+            if owns_sandbox:
+                try:
+                    await sb.terminate.aio()
+                except Exception:
+                    pass
+            # Pool sandboxes are NOT terminated here — pool manages lifecycle
 
         return results
 

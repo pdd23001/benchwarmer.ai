@@ -97,11 +97,21 @@ def main() -> None:
     # ── Step 3: Instance source selection ────────────────────
     config = _instance_selection(config)
 
+    # ── Step 3.5: Create sandbox pool for modal mode ─────────
+    pool = None
+    if args.mode == "modal":
+        from benchwarmer.engine.sandbox_pool import SandboxPool
+        pool = SandboxPool()
+        print("\n🔧 Modal mode: sandboxes will be created for each algorithm")
+        print("   and reused for benchmarking.\n")
+
     # ── Step 4: Register algorithms ─────────────────────────
-    algorithms = _algorithm_registration(config, initial_algorithms=init_algorithms)
+    algorithms = _algorithm_registration(config, initial_algorithms=init_algorithms, pool=pool)
 
     if not algorithms:
         print("⚠️  No algorithms registered. Exiting.")
+        if pool:
+            pool.teardown_all_sync()
         return
 
     from benchwarmer.engine.runner import BenchmarkRunner
@@ -111,7 +121,12 @@ def main() -> None:
         runner.register_algorithm(algo)
 
     print(f"\n🚀 Running benchmark (mode={args.mode})…")
-    df = runner.run(execution_mode=args.mode)
+    try:
+        df = runner.run(execution_mode=args.mode, sandbox_pool=pool)
+    finally:
+        # Tear down all sandboxes after benchmarking
+        if pool:
+            pool.teardown_all_sync()
 
     print(f"\n✅ Benchmark complete — {len(df)} result rows")
     print("-" * 60)
@@ -474,7 +489,7 @@ def _suite_flow(config):
 # Algorithm registration (Implementation Agent + built-in baselines)
 # ──────────────────────────────────────────────────────────────
 
-def _algorithm_registration(config, initial_algorithms=None) -> list:
+def _algorithm_registration(config, initial_algorithms=None, pool=None) -> list:
     """Interactive loop to register algorithms — built-in and LLM-generated."""
     if initial_algorithms is not None:
         algorithms = initial_algorithms
@@ -618,7 +633,8 @@ def _algorithm_registration(config, initial_algorithms=None) -> list:
             result = impl_agent.generate(
                 description=specific_prompt,
                 problem_class=config.problem_class,
-                pdf_paths=valid_paths,  # Pass list of paths
+                pdf_paths=valid_paths,
+                pool=pool,
             )
         else:
             # Treat as standard algorithm description → send to Implementation Agent
@@ -626,6 +642,7 @@ def _algorithm_registration(config, initial_algorithms=None) -> list:
             result = impl_agent.generate(
                 description=user_input,
                 problem_class=config.problem_class,
+                pool=pool,
             )
 
         if result["success"]:

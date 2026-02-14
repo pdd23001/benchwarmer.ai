@@ -15,7 +15,7 @@ import os
 import re
 from typing import Any, Optional
 
-from benchwarmer.utils.algorithm_sandbox import execute_algorithm_code
+from benchwarmer.utils.modal_sandbox import execute_algorithm_code_modal
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +195,7 @@ class ImplementationAgent:
         additional_context: str | None = None,
         pdf_paths: list[str] | None = None,
         max_retries: int = 2,
+        pool=None,
     ) -> dict[str, Any]:
         """
         Generate an AlgorithmWrapper from a natural language description.
@@ -303,8 +304,8 @@ class ImplementationAgent:
 
             last_code = code
 
-            # Execute and smoke test
-            result = execute_algorithm_code(code, problem_class)
+            # Execute and smoke test inside Modal sandbox
+            result = execute_algorithm_code_modal(code, problem_class, pool=pool)
 
             if result["success"]:
                 logger.info(

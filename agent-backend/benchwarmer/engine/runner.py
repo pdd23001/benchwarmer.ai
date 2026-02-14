@@ -124,6 +124,7 @@ class BenchmarkRunner:
         execution_mode: str = "local",
         modal_token_id: str | None = None,
         modal_token_secret: str | None = None,
+        sandbox_pool=None,
     ) -> pd.DataFrame:
         """
         Execute the full benchmark and return a results DataFrame.
@@ -152,6 +153,7 @@ class BenchmarkRunner:
                 self.config,
                 modal_token_id=modal_token_id,
                 modal_token_secret=modal_token_secret,
+                sandbox_pool=sandbox_pool,
             )
             for algo in self.algorithms:
                 modal_runner.register_algorithm(algo)

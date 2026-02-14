@@ -19,11 +19,16 @@ class TestPDFNativeDocs:
                 # Mock a successful response to avoid errors
                 mock_create.return_value.content = [MagicMock(text="```python\nclass A(AlgorithmWrapper): pass\n```")]
                 
-                agent.generate(
-                    description="impl this",
-                    problem_class="max_cut",
-                    pdf_paths=["paper1.pdf", "paper2.pdf"]
-                )
+                # Mock Modal sandbox so we don't actually contact Modal
+                with patch(
+                    "benchwarmer.agents.implementation.execute_algorithm_code_modal",
+                    return_value={"success": False, "error": "mock", "traceback": ""},
+                ):
+                    agent.generate(
+                        description="impl this",
+                        problem_class="max_cut",
+                        pdf_paths=["paper1.pdf", "paper2.pdf"]
+                    )
                 
                 # Verify the API call structure
                 call_args = mock_create.call_args[1]
