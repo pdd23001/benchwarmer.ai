@@ -75,21 +75,14 @@ def main() -> None:
     # ── Step 3: Instance source selection ────────────────────
     config = _instance_selection(config)
 
-    # ── Step 4: Register algorithms & run benchmark ──────────
-    print("\n📌 Configuration finalized. Running benchmark…")
-
-    from benchwarmer.engine.runner import BenchmarkRunner
-
-    algorithms = _get_builtin_algorithms(config.problem_class)
+    # ── Step 4: Register algorithms ─────────────────────────
+    algorithms = _algorithm_registration(config)
 
     if not algorithms:
-        print("⚠️  No built-in algorithms for this problem class.")
-        print("   Register custom ones programmatically. Exiting.")
+        print("⚠️  No algorithms registered. Exiting.")
         return
 
-    print(f"\n🔧 Registered {len(algorithms)} built-in algorithm(s):")
-    for algo in algorithms:
-        print(f"   • {algo.name}")
+    from benchwarmer.engine.runner import BenchmarkRunner
 
     runner = BenchmarkRunner(config)
     for algo in algorithms:
@@ -328,6 +321,126 @@ def _custom_flow(config):
 
     print(f"\n✅ {len(all_instances)} custom instance(s) loaded!")
     return config
+
+# ──────────────────────────────────────────────────────────────
+# Algorithm registration (Implementation Agent + built-in baselines)
+# ──────────────────────────────────────────────────────────────
+
+def _algorithm_registration(config) -> list:
+    """Interactive loop to register algorithms — built-in and LLM-generated."""
+    algorithms = _get_builtin_algorithms(config.problem_class)
+
+    print()
+    print("=" * 60)
+    print("  🧠 Algorithm Registration")
+    print("=" * 60)
+    print()
+
+    if algorithms:
+        print(f"Built-in baselines for '{config.problem_class}':")
+        for algo in algorithms:
+            print(f"   • {algo.name}")
+        print()
+
+    print("You can now describe additional algorithms in natural language.")
+    print("The AI will implement them as working code and register them.")
+    print()
+    print("Examples:")
+    if config.problem_class == "maximum_cut":
+        print('  • "local search that flips nodes improving the cut"')
+        print('  • "simulated annealing with temperature cooling"')
+    elif config.problem_class == "minimum_vertex_cover":
+        print('  • "2-approximation: pick both endpoints of each uncovered edge"')
+        print('  • "LP relaxation rounding for vertex cover"')
+    else:
+        print('  • "greedy heuristic"')
+        print('  • "randomized local search"')
+    print()
+    print("Commands:")
+    print("  run       — start the benchmark with current algorithms")
+    print("  list      — show registered algorithms")
+    print("  remove #  — remove algorithm by number")
+    print()
+
+    from benchwarmer.agents.implementation import ImplementationAgent
+    impl_agent = ImplementationAgent()
+
+    while True:
+        try:
+            user_input = input("🧠 Describe algorithm (or 'run'): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+
+        if not user_input:
+            continue
+
+        lower = user_input.lower()
+
+        if lower in ("run", "start", "go", "benchmark"):
+            if not algorithms:
+                print("   ⚠️  No algorithms registered yet. Describe at least one.")
+                continue
+            break
+
+        if lower in ("list", "ls", "show"):
+            if algorithms:
+                print("\n   Registered algorithms:")
+                for i, algo in enumerate(algorithms):
+                    print(f"   {i}. {algo.name}")
+                print()
+            else:
+                print("   No algorithms registered yet.\n")
+            continue
+
+        if lower.startswith("remove") or lower.startswith("rm"):
+            parts = lower.split()
+            if len(parts) < 2:
+                print("   Usage: remove <number>")
+                continue
+            try:
+                idx = int(parts[1])
+                if 0 <= idx < len(algorithms):
+                    removed = algorithms.pop(idx)
+                    print(f"   ✅ Removed: {removed.name}")
+                else:
+                    print(f"   Invalid index. Range: 0-{len(algorithms)-1}")
+            except ValueError:
+                print("   Invalid number.")
+            continue
+
+        # Treat as algorithm description → send to Implementation Agent
+        print("🤖 Generating algorithm implementation…")
+        result = impl_agent.generate(
+            description=user_input,
+            problem_class=config.problem_class,
+        )
+
+        if result["success"]:
+            print(f"\n✅ Generated: {result['name']}")
+            print("-" * 40)
+            print(result["code"])
+            print("-" * 40)
+            print(f"   Smoke test passed: {result['smoke_result']}")
+
+            algorithms.append(result["algorithm"])
+            print(f"\n   Registered! ({len(algorithms)} total algorithms)\n")
+        else:
+            print(f"\n❌ Failed: {result['error']}")
+            if result.get("code"):
+                print(f"\n   Generated code:")
+                print("-" * 40)
+                print(result["code"])
+                print("-" * 40)
+            if result.get("traceback"):
+                print(result["traceback"])
+            print("   Try a different description.\n")
+
+    print(f"\n📋 Final algorithm list ({len(algorithms)}):")
+    for algo in algorithms:
+        print(f"   • {algo.name}")
+
+    return algorithms
 
 
 # ──────────────────────────────────────────────────────────────
