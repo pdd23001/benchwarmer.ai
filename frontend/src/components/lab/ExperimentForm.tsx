@@ -25,6 +25,12 @@ export function ExperimentForm({ onSubmit, isLoading }: ExperimentFormProps) {
                 <textarea
                     value={query}
                     onChange={(e) => setQuery(e.target.value)}
+                    onKeyDown={(e) => {
+                        if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+                            e.preventDefault();
+                            handleSubmit(e);
+                        }
+                    }}
                     placeholder="Describe your experiment (e.g., 'Benchmark Dijkstra vs A* on a 100x100 grid')"
                     className={cn(
                         "w-full min-h-[120px] p-4 rounded-xl bg-card border border-border text-foreground",
@@ -34,7 +40,7 @@ export function ExperimentForm({ onSubmit, isLoading }: ExperimentFormProps) {
                     disabled={isLoading}
                 />
                 <div className="absolute bottom-3 right-3">
-                    <span className="text-xs text-muted-foreground">Cmd+Enter to run</span>
+                    <span className="text-xs text-muted-foreground">Ctrl+Enter to run</span>
                 </div>
             </div>
 
