@@ -1,3 +1,1 @@
-"""Benchwarmer.AI — Algorithm benchmarking platform."""
-
-__version__ = "0.1.0"
+"""Benchwarmer: upload a research paper PDF → find or generate algorithm implementations."""

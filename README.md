@@ -1,1 +1,5 @@
 # Benchwarmer.AI
+
+Benchwarmer is a **PDF-first algorithm pipeline**: you give it a research paper PDF and it parses the paper, finds or generates implementation code, then runs it. The parser pulls title, abstract, algorithm keywords, and any **GitHub URLs** from the paper. If the paper links to GitHub repos, Perplexity is used to extract code from those repos; otherwise Claude generates an implementation from the paper text. The resulting code is executed either in a **Modal** sandbox (if you’re authenticated and/or deployed) or locally as a fallback.
+
+**How to run:** Use `python scripts/run_pdf_pipeline.py path/to/paper.pdf` (optional: `--no-run` to skip execution, `--json` for JSON output). For execution on Modal, run `modal token new` once, then either `modal run benchwarmer/engine/modal_runner.py --pdf-path path/to/paper.pdf` for the full pipeline with remote execution, or `modal deploy benchwarmer/engine/modal_runner.py` and then run the CLI as usual so code runs on Modal workers.

@@ -1,5 +1,5 @@
-"""Execution engine."""
+"""Execution engine: run generated or fetched code in sandboxed environments."""
 
-from benchwarmer.engine.runner import BenchmarkRunner
+from benchwarmer.engine.modal_runner import run_code_remotely
 
-__all__ = ["BenchmarkRunner"]
+__all__ = ["run_code_remotely"]

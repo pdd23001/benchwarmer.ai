@@ -1,120 +1,56 @@
-"""Pydantic models defining data contracts for Benchwarmer.AI."""
+"""Environment and config for API keys, limits, and domain allowlists."""
 
-from __future__ import annotations
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import List
 
-from enum import Enum
-from typing import Any, Optional
-
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
-
-
-# ---------------------------------------------------------------------------
-# Enums
-# ---------------------------------------------------------------------------
-
-class Objective(str, Enum):
-    MINIMIZE = "minimize"
-    MAXIMIZE = "maximize"
+# Load .env from project root so PERPLEXITY_API_KEY etc. are available
+try:
+    from dotenv import load_dotenv
+    _root = Path(__file__).resolve().parents[1]
+    load_dotenv(_root / ".env")
+except ImportError:
+    pass
 
 
-class RunStatus(str, Enum):
-    SUCCESS = "success"
-    TIMEOUT = "timeout"
-    ERROR = "error"
+@dataclass
+class SearchConfig:
+    """Configuration for Perplexity Sonar and search agent."""
 
-
-class Priority(str, Enum):
-    PRIMARY = "primary"
-    SECONDARY = "secondary"
-    NOT_A_CONCERN = "not a concern"
-    REPORT_ONLY = "report but don't optimize for"
-
-
-# ---------------------------------------------------------------------------
-# Benchmark configuration models
-# ---------------------------------------------------------------------------
-
-class GeneratorConfig(BaseModel):
-    """Configuration for a single instance generator."""
-    model_config = ConfigDict(populate_by_name=True)
-
-    type: str = Field(..., description="Generator type, e.g. 'erdos_renyi'")
-    params: dict[str, Any] = Field(
-        default_factory=dict,
-        description="Extra generator params (e.g. {'p': 0.3})",
-        validation_alias=AliasChoices("params", "parameters"),
+    perplexity_api_key: str = field(default_factory=lambda: os.environ.get("PERPLEXITY_API_KEY", ""))
+    perplexity_base_url: str = field(
+        default_factory=lambda: os.environ.get("PERPLEXITY_BASE_URL", "https://api.perplexity.ai")
     )
-    sizes: list[int] = Field(..., description="Graph sizes to generate")
-    count_per_size: int = Field(default=3, ge=1, description="Instances per size")
-    why: str = Field(default="", description="Reason this generator was chosen")
-
-
-class InstanceConfig(BaseModel):
-    """Specifies which instances to generate."""
-    generators: list[GeneratorConfig]
-    custom_instances: list[dict[str, Any]] = Field(
-        default_factory=list,
-        description="User-uploaded instance dicts",
+    sonar_model: str = field(
+        default_factory=lambda: os.environ.get("PERPLEXITY_SONAR_MODEL", "sonar")
     )
 
-
-class EvaluationPriorities(BaseModel):
-    """What the user cares about most."""
-    solution_quality: Priority = Priority.PRIMARY
-    runtime: str = Field(default="secondary", description="May include hard ceiling")
-    memory: Priority = Priority.NOT_A_CONCERN
-    consistency: Priority = Priority.REPORT_ONLY
-
-
-class ExecutionConfig(BaseModel):
-    """Resource limits for benchmark runs."""
-    timeout_seconds: float = Field(default=60.0, gt=0)
-    runs_per_config: int = Field(default=5, ge=1)
-    memory_limit_mb: int = Field(default=2048, gt=0)
-
-
-class SolutionValidation(BaseModel):
-    """Describes how to check feasibility and compute objectives."""
-    feasibility_check: str = Field(
-        default="",
-        description="Human-readable description of the feasibility rule",
-    )
-    objective_function: str = Field(
-        default="",
-        description="Human-readable description of the objective",
+    # Anthropic / Claude for code generation fallback
+    anthropic_api_key: str = field(default_factory=lambda: os.environ.get("ANTHROPIC_API_KEY", ""))
+    anthropic_model: str = field(
+        default_factory=lambda: os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
     )
 
-
-class BenchmarkConfig(BaseModel):
-    """Top-level configuration produced by the Intake Agent."""
-    problem_class: str
-    problem_description: str = ""
-    objective: Objective = Objective.MINIMIZE
-
-    instance_config: InstanceConfig
-    evaluation_priorities: EvaluationPriorities = Field(
-        default_factory=EvaluationPriorities,
+    max_github_results: int = int(os.environ.get("BENCHWARMER_MAX_GITHUB_RESULTS", "10"))
+    max_paper_results: int = int(os.environ.get("BENCHWARMER_MAX_PAPER_RESULTS", "10"))
+    min_implementation_confidence: float = float(
+        os.environ.get("BENCHWARMER_MIN_IMPL_CONFIDENCE", "0.6")
     )
-    execution_config: ExecutionConfig = Field(default_factory=ExecutionConfig)
-    solution_validation: SolutionValidation = Field(
-        default_factory=SolutionValidation,
+    scrape_domain_allowlist: List[str] = field(
+        default_factory=lambda: [
+            "github.com",
+            "arxiv.org",
+            "doi.org",
+            "scholar.google.com",
+            "papers.nips.cc",
+            "dl.acm.org",
+            "ieee.org",
+        ]
     )
+    scrape_max_depth: int = int(os.environ.get("BENCHWARMER_SCRAPE_MAX_DEPTH", "1"))
 
 
-# ---------------------------------------------------------------------------
-# Result record
-# ---------------------------------------------------------------------------
-
-class BenchmarkResult(BaseModel):
-    """A single benchmark measurement (one algorithm × one instance × one run)."""
-    algorithm_name: str
-    instance_name: str
-    instance_generator: str
-    problem_size: int
-    objective_value: Optional[float] = None
-    wall_time_seconds: float = 0.0
-    peak_memory_mb: float = 0.0
-    status: RunStatus = RunStatus.SUCCESS
-    run_index: int = 0
-    feasible: bool = True
-    error_message: str = ""
+def get_search_config() -> SearchConfig:
+    """Return the active search config (env-backed)."""
+    return SearchConfig()

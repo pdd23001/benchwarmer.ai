@@ -1,25 +1,29 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "benchwarmer"
 version = "0.1.0"
-description = "Algorithm benchmarking platform with NL-driven intake and interactive analysis"
+description = "Algorithm benchmarking with NL intake and Perplexity-backed search"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "networkx>=3.0",
-    "pandas>=2.0",
-    "pydantic>=2.0",
-    "numpy>=1.24",
-    "matplotlib>=3.7",
-    "scipy>=1.10",
+    "httpx>=0.24.0",
+    "pydantic>=2.0.0",
+    "python-dotenv>=1.0.0",
+    "PyMuPDF>=1.24.0",
+    "anthropic>=0.39.0",
+    "modal>=0.64.0",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0"]
-agents = ["anthropic>=0.30"]
+dev = ["pytest>=7.0.0", "pytest-cov"]
 
 [tool.setuptools.packages.find]
+where = ["."]
 include = ["benchwarmer*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
