@@ -27,7 +27,7 @@ export function ExperimentView() {
 
     const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-    const handleRun = async (query: string) => {
+    const handleRun = async (query: string, pdfs: File[], pyFiles: File[], algorithmDescription?: string) => {
         setStatus("running");
         setLogs([]);
         setResults(null);
@@ -35,22 +35,47 @@ export function ExperimentView() {
         // Clear existing logs
         addLog("Analyzing request...", "info");
 
+        if (pyFiles.length > 0) {
+            addLog(`Loading ${pyFiles.length} Python algorithm(s)...`, "info");
+        }
+
+        if (pdfs.length > 0) {
+            addLog(`Processing ${pdfs.length} PDF paper(s)...`, "info");
+        }
+
         try {
+            // Use FormData to send both text and files
+            const formData = new FormData();
+            formData.append("query", query);
+
+            if (algorithmDescription) {
+                formData.append("algorithm_description", algorithmDescription);
+            }
+
+            // Append all Python files
+            pyFiles.forEach((py) => {
+                formData.append("py_files", py);
+            });
+
+            // Append all PDF files
+            pdfs.forEach((pdf) => {
+                formData.append("pdfs", pdf);
+            });
+
             const response = await fetch("/api/python/benchmark", {
                 method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                },
-                body: JSON.stringify({ query }),
+                body: formData,
+                // Don't set Content-Type header - browser will set it with boundary for multipart/form-data
             });
 
             if (!response.ok) {
-                throw new Error(`Error: ${response.statusText}`);
+                const errorText = await response.text();
+                throw new Error(`Error: ${response.statusText} - ${errorText}`);
             }
 
             const data = await response.json();
 
-            // Transform backend response to match chart needs if necessary, 
+            // Transform backend response to match chart needs if necessary,
             // but our backend logic aligns with the component props.
             setResults(data);
             setStatus("complete");

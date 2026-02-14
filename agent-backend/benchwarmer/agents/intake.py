@@ -50,8 +50,9 @@ You have access to the following tools:
 - validate_config(config) → checks if a config is valid and complete
 
 IMPORTANT BEHAVIORS:
+- If you see "[SYSTEM: This is an API request]" in the user's message, NEVER ask clarifying questions. Go directly to generating the config with sensible defaults.
 - If the problem clearly maps to a known class, don't over-ask. Confirm and move on.
-- If it's ambiguous (could be Max-Cut OR graph partitioning), ask ONE clarifying question.
+- If it's ambiguous (could be Max-Cut OR graph partitioning) and NOT an API request, ask ONE clarifying question.
 - Always infer instance generators from the user's domain description:
     - "social networks" → Barabási-Albert, planted partition
     - "road networks" → grid-like graphs, planar graphs
@@ -65,7 +66,7 @@ IMPORTANT BEHAVIORS:
 
 WORKFLOW:
 1. First, call classify_problem with the user's description.
-2. If confidence is high (≥ 0.7), proceed WITHOUT asking questions.
+2. If confidence is high (≥ 0.7) OR this is an API request, proceed WITHOUT asking questions.
    Set sensible defaults for anything the user didn't specify.
 3. Call get_generators to see what's available for the matched class.
 4. Build a BenchmarkConfig JSON using the EXACT schema below.
@@ -83,26 +84,26 @@ BENCHMARK CONFIG SCHEMA (you MUST follow this exactly):
       {
         "type": "erdos_renyi",
         "params": {"p": 0.3},
-        "sizes": [50, 100, 200, 500],
-        "count_per_size": 3,
+        "sizes": [50, 100, 200],
+        "count_per_size": 2,
         "why": "General random benchmark graphs"
-      },
-      {
-        "type": "erdos_renyi",
-        "params": {"p": 0.7},
-        "sizes": [50, 100, 200, 500],
-        "count_per_size": 3,
-        "why": "Dense random graphs"
       }
     ]
   },
   "execution_config": {
     "timeout_seconds": 60,
-    "runs_per_config": 5,
+    "runs_per_config": 3,
     "memory_limit_mb": 2048
   }
 }
 ```
+
+FOR API REQUESTS (when you see [SYSTEM: This is an API request]):
+- Use SMALLER benchmarks for faster results
+- Max 3 sizes (e.g., [50, 100, 200])
+- count_per_size: 2 (not 3 or more)
+- runs_per_config: 3 (not 5 or more)
+- Use 1-2 generator configurations (not 3+)
 
 CRITICAL RULES FOR THE CONFIG:
 - Use "params" (NOT "parameters") for generator params.
@@ -185,7 +186,6 @@ class IntakeAgent:
         messages: list[dict[str, Any]] = [
             {"role": "user", "content": user_description},
         ]
-        logger.info(f"IntakeAgent run() called with: {user_description!r}")  # DEBUG LOG
 
         max_turns = 10  # safety rail
         for turn in range(max_turns):
@@ -232,11 +232,11 @@ class IntakeAgent:
                 # Try to extract a JSON config from the response
                 config = self._try_parse_config(text)
                 if config is not None:
-                    print(f"\n[Intake Agent]:\n{text}")
+                    print(f"\n🤖 Intake Agent:\n{text}")
                     return config
 
                 # No config yet — agent is asking a clarifying question
-                print(f"\n[Intake Agent]:\n{text}")
+                print(f"\n🤖 Intake Agent:\n{text}")
 
                 if not interactive:
                     raise RuntimeError(
@@ -245,7 +245,7 @@ class IntakeAgent:
                     )
 
                 while True:
-                    user_reply = input("\n[Your answer]: ").strip()
+                    user_reply = input("\n📝 Your answer: ").strip()
                     if user_reply:
                         break
                     print("   (Please type a response, or type 'defaults' to let the agent decide)")
