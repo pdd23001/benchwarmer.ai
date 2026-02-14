@@ -1,0 +1,15 @@
+# Core
+networkx>=3.0
+pandas>=2.0
+pydantic>=2.0
+numpy>=1.24
+matplotlib>=3.7
+
+# Optional — used by planar_random generator
+scipy>=1.10
+
+# LLM agents (Phase 2+)
+# anthropic>=0.30
+
+# Testing
+pytest>=7.0
