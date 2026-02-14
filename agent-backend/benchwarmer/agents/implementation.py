@@ -192,6 +192,8 @@ class ImplementationAgent:
         self,
         description: str,
         problem_class: str,
+        additional_context: str | None = None,
+        pdf_paths: list[str] | None = None,
         max_retries: int = 2,
     ) -> dict[str, Any]:
         """
@@ -200,18 +202,23 @@ class ImplementationAgent:
         Parameters
         ----------
         description : str
-            NL description of the algorithm to implement.
+            NL description or instruction.
         problem_class : str
-            The problem class name (e.g. "maximum_cut").
+            The problem class name.
+        additional_context : str | None
+            Optional extra text context.
+        pdf_paths : list[str] | None
+            List of paths to PDF files to attach for analysis.
         max_retries : int
-            Self-correction retries on smoke test failure.
+            Self-correction retries.
 
         Returns
         -------
         dict
-            On success: ``{"success": True, "algorithm": <instance>, "code": "...", "name": "..."}``
-            On failure: ``{"success": False, "error": "...", "code": "..."}``
+            Result dict with code or error.
         """
+        import base64
+
         # Build problem-specific context
         problem_context = PROBLEM_CONTEXTS.get(
             problem_class,
@@ -220,13 +227,54 @@ class ImplementationAgent:
 
         system = SYSTEM_PROMPT.replace("<<<PROBLEM_CONTEXT>>>", problem_context)
 
+        user_content = []
+
+        # 1. Add PDF documents if provided
+        if pdf_paths:
+            for i, path in enumerate(pdf_paths):
+                try:
+                    with open(path, "rb") as f:
+                        pdf_data = base64.b64encode(f.read()).decode("utf-8")
+                    
+                    user_content.append({
+                        "type": "document",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": pdf_data,
+                        }
+                    })
+                except Exception as e:
+                    logger.error(f"Failed to read PDF {path}: {e}")
+                    # Continue with other PDFs if one fails, or maybe we should raise?
+                    # For now, let's just log and continue, but append a note.
+                    if additional_context:
+                        additional_context += f"\n[Error reading {path}: {e}]"
+                    else:
+                        additional_context = f"[Error reading {path}: {e}]"
+            
+            # Augment description to reference the PDFs
+            description += f"\n\n(Refer to the attached {len(pdf_paths)} PDF document(s) for details.)"
+
+        # 2. Add text content (description + additional context)
+        text_part = (
+            f"Implement this algorithm:\n\n{description}\n\n"
+            f"Problem class: {problem_class}"
+        )
+
+        if additional_context:
+            text_part += (
+                f"\n\n--- ADDITIONAL CONTEXT ---\n"
+                f"{additional_context}\n"
+                f"--------------------------"
+            )
+
+        user_content.append({"type": "text", "text": text_part})
+
         messages = [
             {
                 "role": "user",
-                "content": (
-                    f"Implement this algorithm:\n\n{description}\n\n"
-                    f"Problem class: {problem_class}"
-                ),
+                "content": user_content,
             }
         ]
 

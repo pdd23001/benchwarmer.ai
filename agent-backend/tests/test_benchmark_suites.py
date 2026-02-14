@@ -29,15 +29,7 @@ except ImportError:
     pass
 
 
-
 def main() -> None:
-    import argparse
-    from benchwarmer.utils.loader import load_algorithm_from_file
-
-    parser = argparse.ArgumentParser(description="Benchwarmer.AI")
-    parser.add_argument("--custom", "-c", type=str, help="Path to custom algorithm file to benchmark against.")
-    args = parser.parse_args()
-
     logging.basicConfig(
         level=logging.INFO,
         format="%(levelname)s | %(message)s",
@@ -47,19 +39,6 @@ def main() -> None:
     print("  🏋️  Benchwarmer.AI — Algorithm Benchmarking Platform")
     print("=" * 60)
     print()
-
-    # 0. Load custom algorithm if provided
-    init_algorithms = None
-    if args.custom:
-        try:
-            print(f"🔹 Loading custom algorithm from: {args.custom}")
-            custom_algo = load_algorithm_from_file(args.custom)
-            init_algorithms = [custom_algo]
-            print(f"✅ Loaded: {custom_algo.name}")
-            print("🔹 Default baselines disabled.")
-        except Exception as e:
-            print(f"❌ Failed to load custom algorithm: {e}")
-            sys.exit(1)
 
     # ── Step 1: Get problem description ──────────────────────
     print("Describe your optimization problem in natural language.")
@@ -97,7 +76,7 @@ def main() -> None:
     config = _instance_selection(config)
 
     # ── Step 4: Register algorithms ─────────────────────────
-    algorithms = _algorithm_registration(config, initial_algorithms=init_algorithms)
+    algorithms = _algorithm_registration(config)
 
     if not algorithms:
         print("⚠️  No algorithms registered. Exiting.")
@@ -473,12 +452,9 @@ def _suite_flow(config):
 # Algorithm registration (Implementation Agent + built-in baselines)
 # ──────────────────────────────────────────────────────────────
 
-def _algorithm_registration(config, initial_algorithms=None) -> list:
+def _algorithm_registration(config) -> list:
     """Interactive loop to register algorithms — built-in and LLM-generated."""
-    if initial_algorithms is not None:
-        algorithms = initial_algorithms
-    else:
-        algorithms = _get_builtin_algorithms(config.problem_class)
+    algorithms = _get_builtin_algorithms(config.problem_class)
 
     print()
     print("=" * 60)

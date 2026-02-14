@@ -9,7 +9,7 @@ matplotlib>=3.7
 scipy>=1.10
 
 # LLM agents (Phase 2+)
-# anthropic>=0.30
+anthropic>=0.30
 
 # Testing
 pytest>=7.0
