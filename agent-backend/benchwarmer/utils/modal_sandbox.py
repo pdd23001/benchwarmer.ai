@@ -95,8 +95,26 @@ import sys
 import time
 import tracemalloc
 import traceback
+import types
+
+def _inject_benchwarmer_stub():
+    """Inject minimal benchwarmer package so 'from benchwarmer.algorithms.base import AlgorithmWrapper' works."""
+    class AlgorithmWrapper:
+        name = "unnamed"
+        def solve(self, instance, timeout=60.0):
+            raise NotImplementedError
+    base = types.ModuleType("base")
+    base.AlgorithmWrapper = AlgorithmWrapper
+    algorithms = types.ModuleType("algorithms")
+    algorithms.base = base
+    benchwarmer = types.ModuleType("benchwarmer")
+    benchwarmer.algorithms = algorithms
+    sys.modules["benchwarmer"] = benchwarmer
+    sys.modules["benchwarmer.algorithms"] = algorithms
+    sys.modules["benchwarmer.algorithms.base"] = base
 
 def main():
+    _inject_benchwarmer_stub()
     # Read inputs from files written into the sandbox
     with open("/tmp/instance.json", "r") as f:
         instance = json.load(f)
@@ -203,8 +221,26 @@ SMOKE_TEST_SCRIPT = textwrap.dedent('''\
 import json
 import sys
 import traceback
+import types
+
+def _inject_benchwarmer_stub():
+    """Inject minimal benchwarmer package so 'from benchwarmer.algorithms.base import AlgorithmWrapper' works."""
+    class AlgorithmWrapper:
+        name = "unnamed"
+        def solve(self, instance, timeout=60.0):
+            raise NotImplementedError
+    base = types.ModuleType("base")
+    base.AlgorithmWrapper = AlgorithmWrapper
+    algorithms = types.ModuleType("algorithms")
+    algorithms.base = base
+    benchwarmer = types.ModuleType("benchwarmer")
+    benchwarmer.algorithms = algorithms
+    sys.modules["benchwarmer"] = benchwarmer
+    sys.modules["benchwarmer.algorithms"] = algorithms
+    sys.modules["benchwarmer.algorithms.base"] = base
 
 def main():
+    _inject_benchwarmer_stub()
     # Read inputs
     with open("/tmp/algo_source.py", "r") as f:
         algo_source = f.read()

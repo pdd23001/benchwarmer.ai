@@ -1,0 +1,9 @@
+algorithm_name,instance_name,instance_generator,problem_size,objective_value,wall_time_seconds,peak_memory_mb,status,run_index,feasible,error_message
+my_custom_algo,biqmac_g05_60.0,biqmac,60,504.0,0.001736,0.094,success,0,True,
+my_custom_algo,biqmac_g05_60.0,biqmac,60,512.0,0.002666,0.094,success,1,True,
+my_custom_algo,biqmac_g05_80.0,biqmac,80,894.0,0.00413,0.18,success,0,True,
+my_custom_algo,biqmac_g05_80.0,biqmac,80,891.0,0.004098,0.18,success,1,True,
+random_cut,biqmac_g05_60.0,biqmac,60,447.0,8.6e-05,0.001,success,0,True,
+random_cut,biqmac_g05_60.0,biqmac,60,421.0,8.3e-05,0.001,success,1,True,
+random_cut,biqmac_g05_80.0,biqmac,80,784.0,0.000101,0.001,success,0,True,
+random_cut,biqmac_g05_80.0,biqmac,80,782.0,0.000102,0.001,success,1,True,

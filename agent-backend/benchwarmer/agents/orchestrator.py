@@ -741,18 +741,18 @@ class OrchestratorAgent:
                 stats.append(f"{algo_name}: {success} OK, {failed} ERR")
                 
                 if failed > 0 and error_sample is None:
-                    # Capture the first error message we find
                     try:
-                        errors = pd.Series()
-                        if "error" in sub.columns:
-                            errors = sub[sub["status"] == "error"]["error"]
-                        elif "error_message" in sub.columns:
-                            errors = sub[sub["status"] == "error"]["error_message"]
-                        elif "error_msg" in sub.columns:
-                            errors = sub[sub["status"] == "error"]["error_msg"]
-                        
-                        if not errors.empty:
-                            error_sample = f"Error in {algo_name}: {errors.iloc[0]}"
+                        error_col = None
+                        for col_name in ("error_message", "error", "error_msg"):
+                            if col_name in sub.columns:
+                                error_col = col_name
+                                break
+
+                        if error_col:
+                            err_rows = sub[sub["status"] == "error"][error_col]
+                            err_rows = err_rows[err_rows.astype(str).str.strip() != ""]
+                            if not err_rows.empty:
+                                error_sample = f"Error in {algo_name}: {err_rows.iloc[0]}"
                     except Exception:
                         error_sample = f"Error in {algo_name}: (Could not extract message)"
         

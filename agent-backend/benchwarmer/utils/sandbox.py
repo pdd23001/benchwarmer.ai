@@ -82,9 +82,10 @@ def execute_plot_code(
         "None": None,
     }
 
-    # Build the restricted namespace
+    # Build the restricted namespace (df is the benchmark results DataFrame)
     namespace: dict[str, Any] = {
         "__builtins__": safe_builtins,
+        "df": df,
         "pd": pd,
         "np": np,
         "plt": plt,
