@@ -36,6 +36,10 @@ class PipelineState:
     custom_algo_path: str | None = None
     custom_algo_name: str | None = None
     instance_source: str | None = None  # "generator" | "custom" | "suite" | None
+    # Preferences extracted from the user's initial message (so we don't ask again)
+    preferred_runs_per_instance: int | None = None
+    preferred_algo_spec_indices: list[int] | None = None  # e.g. [0, 2]
+    preferred_plot_requests: list[str] | None = None  # NL descriptions to plot after benchmark
 
     def summary(self) -> str:
         """Human-readable summary for the LLM system prompt."""
@@ -62,10 +66,17 @@ class PipelineState:
         else:
             lines.append("Config: NOT SET (run intake first)")
 
+        if self.preferred_runs_per_instance is not None:
+            lines.append(f"User requested runs per instance: {self.preferred_runs_per_instance} (already applied)")
+        if self.preferred_plot_requests:
+            lines.append(f"User requested plots (generate after benchmark): {', '.join(self.preferred_plot_requests)}")
+
         if self.algo_specs:
             specs = [f"[{i}] {s.name} ({s.source})" for i, s in enumerate(self.algo_specs)]
             lines.append(f"Paper algorithms (extracted, not yet coded): {', '.join(specs)}")
-            if not self.algorithms or len(self.algorithms) <= (1 if self.custom_algo_name else 0):
+            if self.preferred_algo_spec_indices is not None:
+                lines.append(f"User requested algorithms (by index): {self.preferred_algo_spec_indices} — call code_algorithm with these indices without asking.")
+            elif not self.algorithms or len(self.algorithms) <= (1 if self.custom_algo_name else 0):
                 lines.append("ACTION REQUIRED: Ask user 'Which of these do you want me to implement? (Reply by index, e.g. 0, 1, or 0 2, or all)' BEFORE asking about instance source.")
 
         if self.algorithms:
@@ -90,13 +101,13 @@ class PipelineState:
 ORCHESTRATOR_TOOLS = [
     {
         "name": "run_intake",
-        "description": "Run the IntakeAgent to analyze the user's problem description (and optional PDFs) to produce a BenchmarkConfig and extract algorithm specs from papers. Call this first to set up the benchmark.",
+        "description": "Run the IntakeAgent to analyze the user's problem description (and optional PDFs) to produce a BenchmarkConfig and extract algorithm specs. Pass the full user message as description — it may also include runs per instance, which algorithms to implement, and which plots they want; these are extracted and carried forward so you do not ask later.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "description": {
                     "type": "string",
-                    "description": "The user's natural-language problem description (e.g. 'max cut', 'vertex cover on sparse graphs').",
+                    "description": "The user's full message (problem description and optionally: runs/trials per instance, which paper algorithms to implement, what plots they want).",
                 },
             },
             "required": ["description"],
@@ -308,21 +319,18 @@ natural language and you use your tools to take actions. You should be helpful, 
 concise, and proactive.
 
 ## Pipeline Steps (order matters after intake)
-1. **Intake**: Analyze the problem description (+ optional PDFs) → BenchmarkConfig + AlgorithmSpecs
-2. **Which algorithms to implement** (do this BEFORE instance source when paper algorithms exist): If "Paper algorithms (extracted, not yet coded)" is listed, you MUST first ask the user which one(s) to implement by index (e.g. "Which should I code: 0, 1, 2, or all?"). Use code_algorithm with spec_indices only after the user answers. Do NOT skip to instance source without asking about algorithms first.
-3. **Instance source** (REQUIRED before benchmark): The user MUST choose one:
-   - **generator** — use_generators (only after user says they want generators)
-   - **custom** — load_custom_instances when user provides a path
-   - **suite** — load_suite when user wants a suite (Biq Mac, DIMACS, SNAP)
+1. **Intake**: Analyze the problem description (+ optional PDFs) → BenchmarkConfig + AlgorithmSpecs. The user may also specify in the same message: runs per instance, which algorithms to implement, and which plots they want — these are carried forward so you do not ask again.
+2. **Which algorithms to implement**: If state shows "User requested algorithms (by index)", call code_algorithm with those indices immediately — do NOT ask. If paper algorithms exist but no such line, ask the user which to implement by index before instance source.
+3. **Instance source** (REQUIRED before benchmark): The user MUST choose one: generator, custom, or suite (see tools).
 4. **Configure**: Modify generators/instances, execution settings
 5. **Benchmark**: Run the benchmark
-6. **Analysis**: Visualize and analyze results
+6. **Analysis**: If state shows "User requested plots (generate after benchmark)", after run_benchmark call analyze_results for EACH requested plot, then ask "Would you like any other visualizations or analysis?" Otherwise do NOT call analyze_results unless the user explicitly asks.
 
 ## Key Behaviors
-- After intake: if there are paper algorithms (extracted, not yet coded), your FIRST question MUST be: "Which algorithm(s) from the list do you want me to implement? (Reply by index, e.g. 0, 1, or 0 2, or 'all'.)" Do NOT ask about instances until the user has answered this (or said they only want their custom algo).
+- When "User requested algorithms (by index)" is in state, call code_algorithm with that list without asking. When "User requested plots" is in state, after run_benchmark call analyze_results for each listed request, then ask if they want more.
 - When "Instance source: NOT CHOSEN" appears in state, ask the user to choose: generator, custom JSON file, or benchmark suite. Do NOT call use_generators until the user explicitly chooses generators.
 - When using load_suite: after you list instances (first call with empty instance_names), you MUST wait for the user to tell you which instance names to load. Do NOT call load_suite again with all names — only pass the instance_names the user asked for. If the user says "all" or "load all", then you may pass the full list.
-- Do NOT call analyze_results unless the user explicitly asks for a plot, chart, or analysis (e.g. "plot a bar chart", "show me runtimes"). After run_benchmark, just report that results are ready and ask what they want to do next — do not auto-generate any visualization.
+- Do NOT call analyze_results except: (1) state lists "User requested plots" — then call for each after benchmark and ask for more; or (2) the user explicitly asks for a plot/chart/analysis in a later message.
 - The user can go back to any step at any time
 - If the user says "go back", "undo", "restart", or "change X", use the appropriate tool
 - If the user describes a problem, run intake automatically
@@ -333,6 +341,76 @@ concise, and proactive.
 ## Current Pipeline State
 {state_summary}
 """
+
+
+# ──────────────────────────────────────────────────────────────
+# User preference extraction (from initial message)
+# ──────────────────────────────────────────────────────────────
+
+def _extract_user_preferences(backend: Any, user_message: str, algo_specs: list) -> dict[str, Any]:
+    """
+    Extract runs_per_instance, algo_indices, and plot_requests from the user's
+    message so we can carry them forward without asking again.
+    Returns dict with keys: runs_per_instance (int|None), algo_indices (list[int]|None), plot_requests (list[str]|None).
+    """
+    if not user_message.strip():
+        return {"runs_per_instance": None, "algo_indices": None, "plot_requests": None}
+
+    algo_list = "\n".join(f"  [{i}] {s.name}" for i, s in enumerate(algo_specs)) if algo_specs else "(none)"
+
+    system = """You extract structured preferences from the user's message. Reply with ONLY a single JSON object, no markdown, no explanation.
+Use these exact keys:
+- "runs_per_instance": integer or null (e.g. 5, 10 if they said "5 runs", "10 trials per instance")
+- "algo_indices": list of 0-based integers or null (which paper algorithms to implement; if they say "all" use null to mean ask later; if they name algorithms match by name to index)
+- "plot_requests": list of strings or null (each string is a natural-language plot/visualization request, e.g. "bar chart of runtimes", "scatter objective vs size")
+If something is not mentioned, use null for that key."""
+
+    user_content = f"""User message:
+{user_message}
+
+Paper algorithms (by index):
+{algo_list}
+
+Extract runs_per_instance, algo_indices, and plot_requests. Output only the JSON object."""
+
+    try:
+        response = backend.generate(
+            messages=[{"role": "user", "content": user_content}],
+            system=system,
+            tools=None,
+            max_tokens=512,
+        )
+        text = ""
+        for block in response.content:
+            if hasattr(block, "text"):
+                text += block.text
+        text = text.strip()
+        # Strip markdown code block if present
+        if "```" in text:
+            for marker in ("```json", "```"):
+                if marker in text:
+                    start = text.index(marker) + len(marker)
+                    end = text.find("```", start)
+                    text = text[start:(end if end != -1 else None)].strip()
+                    break
+        data = json.loads(text)
+        runs = data.get("runs_per_instance")
+        if runs is not None and not isinstance(runs, int):
+            runs = int(runs) if isinstance(runs, (float, str)) and str(runs).isdigit() else None
+        indices = data.get("algo_indices")
+        if indices is not None and not isinstance(indices, list):
+            indices = None
+        if indices is not None:
+            indices = [int(i) for i in indices if isinstance(i, (int, float)) or (isinstance(i, str) and i.isdigit())]
+        plots = data.get("plot_requests")
+        if plots is not None and not isinstance(plots, list):
+            plots = [str(plots)] if plots else None
+        if plots is not None:
+            plots = [str(p).strip() for p in plots if p]
+        return {"runs_per_instance": runs, "algo_indices": indices if indices else None, "plot_requests": plots or None}
+    except Exception as e:
+        logger.warning("Could not extract user preferences: %s", e)
+        return {"runs_per_instance": None, "algo_indices": None, "plot_requests": None}
 
 
 # ──────────────────────────────────────────────────────────────
@@ -553,6 +631,14 @@ class OrchestratorAgent:
         self.state.algo_specs = result.algorithms
         self.state.instance_source = None  # Reset — user must choose
 
+        # Extract preferences from the same user message so we don't ask later
+        prefs = _extract_user_preferences(self.backend, description, self.state.algo_specs)
+        self.state.preferred_runs_per_instance = prefs.get("runs_per_instance")
+        self.state.preferred_algo_spec_indices = prefs.get("algo_indices")
+        self.state.preferred_plot_requests = prefs.get("plot_requests")
+        if self.state.preferred_runs_per_instance is not None:
+            self.state.config.execution_config.runs_per_config = self.state.preferred_runs_per_instance
+
         lines = [f"✅ IntakeAgent complete! Problem class: {result.config.problem_class}"]
 
         gens = result.config.instance_config.generators
@@ -562,12 +648,21 @@ class OrchestratorAgent:
         ec = result.config.execution_config
         lines.append(f"   Runs: {ec.runs_per_config}, Timeout: {ec.timeout_seconds}s")
 
+        if self.state.preferred_runs_per_instance is not None:
+            lines.append(f"   (Using {self.state.preferred_runs_per_instance} runs per instance from your message)")
+        if self.state.preferred_algo_spec_indices is not None:
+            names = [self.state.algo_specs[i].name for i in self.state.preferred_algo_spec_indices if 0 <= i < len(self.state.algo_specs)]
+            lines.append(f"   Will implement: {', '.join(names)} (from your message)")
+        if self.state.preferred_plot_requests:
+            lines.append(f"   Will generate these plots after benchmark: {', '.join(self.state.preferred_plot_requests)}")
+
         if self.state.algo_specs:
             lines.append(f"\n📋 Extracted {len(self.state.algo_specs)} algorithm(s) from papers:")
             for i, spec in enumerate(self.state.algo_specs):
                 lines.append(f"   [{i}] {spec.name}: {spec.approach} (source: {spec.source})")
 
-        lines.append("\nHow would you like to provide instances? (generator / custom JSON / benchmark suite)")
+        if not self.state.instance_source:
+            lines.append("\nHow would you like to provide instances? (generator / custom JSON / benchmark suite)")
 
         return "\n".join(lines)
 
@@ -763,6 +858,8 @@ class OrchestratorAgent:
         msg = f"✅ Benchmark complete! {len(df)} rows. ({stats_str})."
         if error_sample:
             msg += f"\n❌ {error_sample}"
+        if self.state.preferred_plot_requests:
+            return msg + "\nGenerate the requested plots (call analyze_results for each item in state 'User requested plots'), then ask if they would like any other visualizations."
         return msg + "\nDo not call analyze_results unless the user explicitly asks for a plot, chart, or analysis."
 
     def _tool_analyze_results(self, data: dict) -> str:
