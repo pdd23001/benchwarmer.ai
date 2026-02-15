@@ -13,6 +13,11 @@ import tracemalloc
 from concurrent.futures import ProcessPoolExecutor, TimeoutError as FuturesTimeout
 from typing import Any
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
+
 import pandas as pd
 
 from benchwarmer.config import (
@@ -181,20 +186,19 @@ class BenchmarkRunner:
         records: list[BenchmarkResult] = []
 
         total = len(self.algorithms) * len(self._instances) * runs
-        done = 0
+        
+        # Use tqdm if available, otherwise just use silent iteration (logs will still be captured if error)
+        iterable = self.algorithms
+        pbar = None
+        if tqdm:
+            pbar = tqdm(total=total, desc="Running Benchmark", unit="run")
 
-        for algo in self.algorithms:
+        for algo in iterable:
             for inst in self._instances:
                 for run_idx in range(runs):
-                    done += 1
                     inst_name = inst.get("instance_name", "unknown")
                     gen_name = inst.get("metadata", {}).get("generator", "custom")
                     size = inst.get("metadata", {}).get("size", len(inst.get("nodes", [])))
-
-                    logger.info(
-                        "[%d/%d] %s × %s (run %d)",
-                        done, total, algo.name, inst_name, run_idx,
-                    )
 
                     # --- execute ---
                     if parallel:
@@ -229,6 +233,12 @@ class BenchmarkRunner:
                         feasible=feasible,
                         error_message=raw.get("error", ""),
                     ))
+                    
+                    if pbar:
+                        pbar.update(1)
+
+        if pbar:
+            pbar.close()
 
         df = pd.DataFrame([r.model_dump() for r in records])
         logger.info("Benchmark complete — %d results collected", len(df))

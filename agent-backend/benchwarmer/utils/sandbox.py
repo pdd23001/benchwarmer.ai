@@ -10,6 +10,8 @@ from __future__ import annotations
 import io
 import os
 import traceback
+import math
+import json
 from typing import Any, Optional
 
 
@@ -83,11 +85,12 @@ def execute_plot_code(
     # Build the restricted namespace
     namespace: dict[str, Any] = {
         "__builtins__": safe_builtins,
-        "df": df.copy(),
         "pd": pd,
         "np": np,
         "plt": plt,
         "matplotlib": matplotlib,
+        "math": math,
+        "json": json,
         "output_path": default_path,
     }
 

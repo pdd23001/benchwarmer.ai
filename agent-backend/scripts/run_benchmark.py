@@ -30,7 +30,8 @@ except ImportError:
 
 
 
-def main() -> None:
+def _legacy_main() -> None:
+    """Original step-by-step pipeline (used with --no-orchestrator)."""
     import argparse
     from benchwarmer.utils.loader import load_algorithm_from_file
 
@@ -41,6 +42,7 @@ def main() -> None:
     parser.add_argument("--intake-backend", type=str, default="claude", choices=["claude", "nemotron"], help="LLM backend for Intake Agent.")
     parser.add_argument("--nemotron-url", type=str, default="https://integrate.api.nvidia.com/v1", help="Base URL for Nemotron/OpenAI-compatible backend.")
     parser.add_argument("--nemotron-model", type=str, default="nvidia/nemotron-3-nano-30b-a3b", help="Model name for Nemotron backend.")
+    parser.add_argument("--no-orchestrator", action="store_true", help="Use legacy step-by-step flow.")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -1122,6 +1124,50 @@ def _analysis_loop(df, config) -> None:
                 print(result["traceback"])
 
         print()
+
+
+def main() -> None:
+    """Entry point — uses orchestrator by default, legacy flow with --no-orchestrator."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Benchwarmer.AI")
+    parser.add_argument("--custom", "-c", type=str, help="Path to custom algorithm file to benchmark against.")
+    parser.add_argument("--papers", "-p", nargs="+", type=str, help="PDF papers to analyze for algorithm extraction.")
+    parser.add_argument("--mode", "-m", type=str, default="local", choices=["local", "modal"], help="Execution mode.")
+    parser.add_argument("--intake-backend", type=str, default="claude", choices=["claude", "nemotron"], help="LLM backend for Intake Agent.")
+    parser.add_argument("--nemotron-url", type=str, default="https://integrate.api.nvidia.com/v1", help="Base URL for Nemotron.")
+    parser.add_argument("--nemotron-model", type=str, default="nvidia/nemotron-3-nano-30b-a3b", help="Model name for Nemotron.")
+    parser.add_argument("--no-orchestrator", action="store_true", help="Use legacy step-by-step flow instead of conversational mode.")
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s | %(message)s",
+    )
+
+    if args.no_orchestrator:
+        _legacy_main()
+        return
+
+    # ── Conversational Orchestrator Mode ──
+    from benchwarmer.agents.orchestrator import OrchestratorAgent
+
+    # Validate PDF paths
+    pdf_paths = None
+    if args.papers:
+        pdf_paths = [p for p in args.papers if os.path.exists(p)]
+        if not pdf_paths:
+            pdf_paths = None
+
+    orch = OrchestratorAgent(
+        execution_mode=args.mode,
+        intake_backend=args.intake_backend,
+        pdf_paths=pdf_paths,
+        custom_algo_path=args.custom,
+        nemotron_url=args.nemotron_url,
+        nemotron_model=args.nemotron_model,
+    )
+    orch.run()
 
 
 if __name__ == "__main__":

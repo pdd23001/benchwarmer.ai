@@ -82,6 +82,14 @@ def load_algorithm_from_file(file_path: str) -> AlgorithmWrapper:
         # Ensure it has a name
         if not hasattr(instance, "name") or instance.name == "unnamed":
              instance.name = module_name
+        
+        # Attach source code for Modal serialization
+        try:
+            instance._source_code = path.read_text(encoding="utf-8")
+        except Exception:
+            # Fallback (non-critical, modal_runner might use inspect)
+            pass
+
         return instance
     except Exception as e:
         raise ValueError(f"Failed to instantiate {candidates[0].__name__}: {e}")
