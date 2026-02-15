@@ -1,15 +1,16 @@
-# Core
+# Core dependencies
 networkx>=3.0
 pandas>=2.0
 pydantic>=2.0
 numpy>=1.24
 matplotlib>=3.7
+tqdm>=4.60
 
 # Optional — used by planar_random generator
 scipy>=1.10
 
 # LLM agents (Phase 2+)
-# anthropic>=0.30
+anthropic>=0.30
 
 # Testing
 pytest>=7.0
@@ -20,5 +21,13 @@ uvicorn>=0.27.0
 python-multipart>=0.0.6  # Required for file uploads in FastAPI
 
 # LLM & Utils
-anthropic>=0.3.0
 python-dotenv>=1.0.0
+
+# Modal sandbox (remote execution)
+modal>=0.70
+
+# PDF text extraction
+PyMuPDF>=1.24
+
+# OpenAI-compatible backends (Nemotron)
+openai>=1.0
