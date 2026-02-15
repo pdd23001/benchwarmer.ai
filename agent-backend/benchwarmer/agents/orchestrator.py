@@ -990,26 +990,27 @@ class OrchestratorAgent:
         runs = self.state.config.execution_config.runs_per_config
         print(f"  🚀 Running benchmark ({mode}): {len(algo_names)} algos × {total_inst} instances × {runs} runs")
 
-        # Emit benchmark_start event via progress_cb
-        runs_per_algo = total_inst * runs
-        if self._progress_cb:
-            self._progress_cb({
-                "type": "benchmark_start",
-                "algorithms": [
-                    {"name": a.name, "total_runs": runs_per_algo}
-                    for a in self.state.algorithms
-                ],
-            })
-
-        # Create a progress callback for the runner
-        def _bench_progress(algo_name, completed, total):
+        # Emit sandbox visualization events only for modal (parallel) mode
+        _bench_progress = None
+        if mode == "modal":
+            runs_per_algo = total_inst * runs
             if self._progress_cb:
                 self._progress_cb({
-                    "type": "benchmark_progress",
-                    "algorithm": algo_name,
-                    "completed": completed,
-                    "total": total,
+                    "type": "benchmark_start",
+                    "algorithms": [
+                        {"name": a.name, "total_runs": runs_per_algo}
+                        for a in self.state.algorithms
+                    ],
                 })
+
+            def _bench_progress(algo_name, completed, total):
+                if self._progress_cb:
+                    self._progress_cb({
+                        "type": "benchmark_progress",
+                        "algorithm": algo_name,
+                        "completed": completed,
+                        "total": total,
+                    })
 
         try:
             df = runner.run(execution_mode=mode, sandbox_pool=pool, progress_fn=_bench_progress)
@@ -1024,8 +1025,8 @@ class OrchestratorAgent:
 
         self.state.results = df
 
-        # Emit benchmark_complete event
-        if self._progress_cb:
+        # Emit benchmark_complete event (only if we started sandbox visualization)
+        if mode == "modal" and self._progress_cb:
             self._progress_cb({"type": "benchmark_complete"})
 
         # ── Build CLI-style summary table ──────────────────────────────
