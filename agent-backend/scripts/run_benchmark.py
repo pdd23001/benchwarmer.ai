@@ -40,8 +40,8 @@ def _legacy_main() -> None:
     parser.add_argument("--papers", "-p", nargs="+", type=str, help="PDF papers to analyze for algorithm extraction.")
     parser.add_argument("--mode", "-m", type=str, default="local", choices=["local", "modal"], help="Execution mode: 'local' (default) or 'modal' (remote sandbox).")
     parser.add_argument("--intake-backend", type=str, default="claude", choices=["claude", "nemotron"], help="LLM backend for Intake Agent.")
-    parser.add_argument("--nemotron-url", type=str, default="https://integrate.api.nvidia.com/v1", help="Base URL for Nemotron/OpenAI-compatible backend.")
-    parser.add_argument("--nemotron-model", type=str, default="nvidia/nemotron-3-nano-30b-a3b", help="Model name for Nemotron backend.")
+    parser.add_argument("--nemotron-url", type=str, default="http://10.19.177.52:11434/api", help="Base URL for Nemotron/OpenAI-compatible backend.")
+    parser.add_argument("--nemotron-model", type=str, default="hf.co/unsloth/Nemotron-3-Nano-30B-A3B-GGUF:Q4_K_M", help="Model name for Nemotron backend.")
     parser.add_argument("--no-orchestrator", action="store_true", help="Use legacy step-by-step flow.")
     args = parser.parse_args()
 
@@ -1135,8 +1135,8 @@ def main() -> None:
     parser.add_argument("--papers", "-p", nargs="+", type=str, help="PDF papers to analyze for algorithm extraction.")
     parser.add_argument("--mode", "-m", type=str, default="local", choices=["local", "modal"], help="Execution mode.")
     parser.add_argument("--intake-backend", type=str, default="claude", choices=["claude", "nemotron"], help="LLM backend for both Orchestrator and Intake (claude or nemotron).")
-    parser.add_argument("--nemotron-url", type=str, default="https://integrate.api.nvidia.com/v1", help="Base URL for Nemotron (when --intake-backend=nemotron).")
-    parser.add_argument("--nemotron-model", type=str, default="nvidia/nemotron-3-nano-30b-a3b", help="Model name for Nemotron (when --intake-backend=nemotron).")
+    parser.add_argument("--nemotron-url", type=str, default="http://10.19.177.52:11434/v1", help="Base URL for Nemotron (when --intake-backend=nemotron).")
+    parser.add_argument("--nemotron-model", type=str, default="hf.co/unsloth/Nemotron-3-Nano-30B-A3B-GGUF:Q4_K_M", help="Model name for Nemotron (when --intake-backend=nemotron).")
     parser.add_argument("--no-orchestrator", action="store_true", help="Use legacy step-by-step flow instead of conversational mode.")
     args = parser.parse_args()
 
@@ -1168,6 +1168,8 @@ def main() -> None:
         nemotron_model=args.nemotron_model,
     )
     orch.run()
+    print(args.nemotron_model)
+    print(args.nemotron_url)
 
 
 if __name__ == "__main__":

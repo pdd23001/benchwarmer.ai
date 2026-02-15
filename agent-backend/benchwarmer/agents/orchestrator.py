@@ -13,7 +13,7 @@ import logging
 import os
 import sys
 from dataclasses import asdict, dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from benchwarmer.utils.loader import load_algorithm_from_file
 
@@ -36,6 +36,8 @@ class PipelineState:
     custom_algo_path: str | None = None
     custom_algo_name: str | None = None
     instance_source: str | None = None  # "generator" | "custom" | "suite" | None
+    # Plot path from latest analyze_results call (consumed by server after each turn)
+    last_plot_path: str | None = None
     # Preferences extracted from the user's initial message (so we don't ask again)
     preferred_runs_per_instance: int | None = None
     preferred_algo_spec_indices: list[int] | None = None  # e.g. [0, 2]
@@ -320,17 +322,19 @@ concise, and proactive.
 
 ## Pipeline Steps (order matters after intake)
 1. **Intake**: Analyze the problem description (+ optional PDFs) → BenchmarkConfig + AlgorithmSpecs. The user may also specify in the same message: runs per instance, which algorithms to implement, and which plots they want — these are carried forward so you do not ask again.
-2. **Which algorithms to implement**: If state shows "User requested algorithms (by index)", call code_algorithm with those indices immediately — do NOT ask. If paper algorithms exist but no such line, ask the user which to implement by index before instance source.
+2. **Which algorithms to implement**: If state shows "User requested algorithms (by index)", call code_algorithm with those indices immediately — do NOT ask. If paper algorithms exist AND the user uploaded PDFs, implement ALL paper algorithm after asking, and confirming— call code_algorithm with all indicec. If more than 1 algorithm is present, always prompt the user to confirm which algorithms to run.
 3. **Instance source** (REQUIRED before benchmark): The user MUST choose one: generator, custom, or suite (see tools).
 4. **Configure**: Modify generators/instances, execution settings
-5. **Benchmark**: Run the benchmark
-6. **Analysis**: If state shows "User requested plots (generate after benchmark)", after run_benchmark call analyze_results for EACH requested plot, then ask "Would you like any other visualizations or analysis?" Otherwise do NOT call analyze_results unless the user explicitly asks.
+5. **Benchmark**: Run the benchmark → you receive a **summary table** with avg runtime, avg memory, success rate per algorithm. Present this table to the user verbatim (keep the markdown table format). No charts are generated at this stage.
+6. **Analysis**: After presenting the benchmark summary table, ask: "Would you like any plots or visualizations of these results?" Only call analyze_results when the user explicitly says yes or requests specific plots. If state shows "User requested plots (generate after benchmark)", call analyze_results for EACH requested plot after asking the user, then ask if they want more.
 
 ## Key Behaviors
+- **Short replies like "0", "1", "0 2", "all", "generators", "yes", "run" are ANSWERS to your previous question.** Interpret them in context of what you last asked. For example, if you asked "Which algorithms do you want me to implement?" and the user replies "0", that means "implement algorithm at index 0" — call code_algorithm with spec_indices=[0]. If you asked about instance source and the user replies "generators", call use_generators. NEVER ask for clarification when the user gives a clear index or keyword.
 - When "User requested algorithms (by index)" is in state, call code_algorithm with that list without asking. When "User requested plots" is in state, after run_benchmark call analyze_results for each listed request, then ask if they want more.
 - When "Instance source: NOT CHOSEN" appears in state, ask the user to choose: generator, custom JSON file, or benchmark suite. Do NOT call use_generators until the user explicitly chooses generators.
 - When using load_suite: after you list instances (first call with empty instance_names), you MUST wait for the user to tell you which instance names to load. Do NOT call load_suite again with all names — only pass the instance_names the user asked for. If the user says "all" or "load all", then you may pass the full list.
-- Do NOT call analyze_results except: (1) state lists "User requested plots" — then call for each after benchmark and ask for more; or (2) the user explicitly asks for a plot/chart/analysis in a later message.
+- Do NOT call analyze_results unless the user explicitly asks for a plot/chart/visualization. Exception: if state lists "User requested plots", ask the user to confirm, then call analyze_results for each.
+- After run_benchmark, you get a markdown summary table. Present it to the user EXACTLY (keep the | table format). Then ask "Would you like any plots or visualizations?" Do NOT generate plots automatically.
 - The user can go back to any step at any time
 - If the user says "go back", "undo", "restart", or "change X", use the appropriate tool
 - If the user describes a problem, run intake automatically
@@ -465,7 +469,90 @@ class OrchestratorAgent:
                 print(f"❌ Custom algorithm file not found: {self.state.custom_algo_path}")
 
     # ------------------------------------------------------------------
-    # Main loop
+    # One-turn API (for web frontend multi-turn chat)
+    # ------------------------------------------------------------------
+
+    def run_one_turn(
+        self,
+        messages: list[dict[str, Any]],
+        user_message: str,
+        max_tool_turns: int = 15,
+        progress_cb: Callable[[dict], None] | None = None,
+    ) -> tuple[list[dict[str, Any]], str]:
+        """
+        Append *user_message*, run LLM tool loop until final text reply.
+        Returns ``(updated_messages, assistant_reply_text)``.
+
+        If *progress_cb* is provided it is called with event dicts:
+            {"type": "thinking"}
+            {"type": "tool_start", "tool": <name>, "input": <dict>}
+            {"type": "tool_end",   "tool": <name>, "result": <str>}
+        """
+        messages.append({"role": "user", "content": user_message})
+
+        system = ORCHESTRATOR_SYSTEM_PROMPT.format(
+            state_summary=self.state.summary(),
+        )
+        reply_text = ""
+
+        for _ in range(max_tool_turns):
+            if progress_cb:
+                progress_cb({"type": "thinking"})
+
+            try:
+                response = self.backend.generate(
+                    messages=messages,
+                    system=system,
+                    tools=ORCHESTRATOR_TOOLS,
+                    max_tokens=4096,
+                )
+            except Exception as e:
+                logger.exception("LLM generate error: %s", e)
+                reply_text = f"Error: {e}"
+                break
+
+            if response.stop_reason == "tool_use":
+                assistant_content = [asdict(b) for b in response.content]
+                messages.append({"role": "assistant", "content": assistant_content})
+
+                tool_results = []
+                for block in response.content:
+                    if block.type == "tool_use":
+                        logger.info("Tool call: %s", block.name)
+                        if progress_cb:
+                            progress_cb({"type": "tool_start", "tool": block.name, "input": block.input})
+                        result_str = self._dispatch_tool(block.name, block.input)
+                        if progress_cb:
+                            progress_cb({"type": "tool_end", "tool": block.name, "result": result_str[:1500]})
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": result_str,
+                        })
+                messages.append({"role": "user", "content": tool_results})
+
+                # Refresh system prompt (state may have changed)
+                system = ORCHESTRATOR_SYSTEM_PROMPT.format(
+                    state_summary=self.state.summary(),
+                )
+                continue
+
+            # Final text reply
+            if response.stop_reason in ("end_turn", "stop"):
+                for block in response.content:
+                    if hasattr(block, "text"):
+                        reply_text += block.text
+                serialized = [asdict(b) for b in response.content]
+                messages.append({"role": "assistant", "content": serialized})
+                break
+
+            logger.warning("Unexpected stop_reason: %s", response.stop_reason)
+            break
+
+        return messages, reply_text.strip()
+
+    # ------------------------------------------------------------------
+    # Main loop (CLI)
     # ------------------------------------------------------------------
 
     def run(self) -> None:
@@ -827,40 +914,56 @@ class OrchestratorAgent:
                     pass
 
         self.state.results = df
-        
-        # Summarize results
-        stats = []
-        error_sample = None
-        if "algorithm_name" in df.columns and "status" in df.columns:
-            for algo_name in df["algorithm_name"].unique():
-                sub = df[df["algorithm_name"] == algo_name]
-                success = len(sub[sub["status"] == "success"])
-                failed = len(sub) - success
-                stats.append(f"{algo_name}: {success} OK, {failed} ERR")
-                
-                if failed > 0 and error_sample is None:
-                    try:
-                        error_col = None
-                        for col_name in ("error_message", "error", "error_msg"):
-                            if col_name in sub.columns:
-                                error_col = col_name
-                                break
 
-                        if error_col:
-                            err_rows = sub[sub["status"] == "error"][error_col]
-                            err_rows = err_rows[err_rows.astype(str).str.strip() != ""]
-                            if not err_rows.empty:
-                                error_sample = f"Error in {algo_name}: {err_rows.iloc[0]}"
-                    except Exception:
-                        error_sample = f"Error in {algo_name}: (Could not extract message)"
-        
-        stats_str = "; ".join(stats)
-        msg = f"✅ Benchmark complete! {len(df)} rows. ({stats_str})."
-        if error_sample:
-            msg += f"\n❌ {error_sample}"
+        # ── Build CLI-style summary table ──────────────────────────────
+        import pandas as _pd
+
+        success_df = df[df["status"] == "success"] if "status" in df.columns else df
+        total_rows = len(df)
+        success_rows = len(success_df)
+
+        lines = [f"✅ Benchmark complete! {total_rows} result rows ({success_rows} successful)."]
+
+        if not success_df.empty and "algorithm_name" in success_df.columns:
+            # Build per-algorithm stats
+            table_lines = []
+            table_lines.append("")
+            table_lines.append("| Algorithm | Avg Objective | Avg Runtime (s) | Avg Memory (MB) | Success Rate |")
+            table_lines.append("|-----------|--------------|-----------------|-----------------|--------------|")
+
+            for algo_name in df["algorithm_name"].unique():
+                algo_all = df[df["algorithm_name"] == algo_name]
+                algo_ok = algo_all[algo_all["status"] == "success"] if "status" in algo_all.columns else algo_all
+                total = len(algo_all)
+                ok = len(algo_ok)
+                rate = f"{ok}/{total} ({100 * ok // max(total, 1)}%)"
+
+                avg_obj = f"{algo_ok['objective_value'].mean():.1f}" if "objective_value" in algo_ok.columns and not algo_ok.empty else "—"
+                avg_rt = f"{algo_ok['wall_time_seconds'].mean():.4f}" if "wall_time_seconds" in algo_ok.columns and not algo_ok.empty else "—"
+                avg_mem = f"{algo_ok['peak_memory_mb'].mean():.1f}" if "peak_memory_mb" in algo_ok.columns and not algo_ok.empty else "—"
+
+                table_lines.append(f"| {algo_name} | {avg_obj} | {avg_rt} | {avg_mem} | {rate} |")
+
+            table_lines.append("")
+            lines.extend(table_lines)
+
+        # Error sample if any
+        if "status" in df.columns:
+            error_df = df[df["status"] != "success"]
+            if not error_df.empty:
+                for col_name in ("error_message", "error", "error_msg"):
+                    if col_name in error_df.columns:
+                        sample = error_df[col_name].dropna()
+                        sample = sample[sample.astype(str).str.strip() != ""]
+                        if not sample.empty:
+                            lines.append(f"❌ Sample error: {sample.iloc[0]}")
+                        break
+
+        msg = "\n".join(lines)
+
         if self.state.preferred_plot_requests:
-            return msg + "\nGenerate the requested plots (call analyze_results for each item in state 'User requested plots'), then ask if they would like any other visualizations."
-        return msg + "\nDo not call analyze_results unless the user explicitly asks for a plot, chart, or analysis."
+            return msg + "\nPresent this summary table to the user EXACTLY as shown above (keep the markdown table formatting). Then generate the requested plots (call analyze_results for each item in state 'User requested plots'), then ask if they would like any other visualizations."
+        return msg + "\nPresent this summary table to the user EXACTLY as shown above (keep the markdown table formatting). Then ask: 'Would you like any plots or visualizations of these results?' Do NOT call analyze_results until the user asks."
 
     def _tool_analyze_results(self, data: dict) -> str:
         if self.state.results is None:
@@ -904,7 +1007,8 @@ class OrchestratorAgent:
         if result["success"]:
             self.plot_index += 1
             if result.get("output_path") and os.path.exists(result["output_path"]):
-                return f"✅ Plot saved to: {result['output_path']}"
+                self.state.last_plot_path = result["output_path"]
+                return f"✅ Plot generated and displayed to the user. File: {result['output_path']}"
             elif result.get("message"):
                 return result["message"]
             if result.get("stdout"):
