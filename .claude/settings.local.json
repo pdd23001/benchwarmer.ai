@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:www.fetch.ai)",
+      "WebFetch(domain:fetch.ai)",
+      "WebSearch",
+      "WebFetch(domain:uagents.fetch.ai)",
+      "WebFetch(domain:innovationlab.fetch.ai)",
+      "Bash(pip install:*)",
+      "Bash(python -c:*)",
+      "Bash(python agent.py:*)",
+      "Bash(python3:*)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:docs.fetch.ai)"
+    ]
+  }
+}
