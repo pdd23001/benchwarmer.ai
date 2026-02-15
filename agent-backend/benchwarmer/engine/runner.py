@@ -130,6 +130,7 @@ class BenchmarkRunner:
         modal_token_id: str | None = None,
         modal_token_secret: str | None = None,
         sandbox_pool=None,
+        progress_fn=None,
     ) -> pd.DataFrame:
         """
         Execute the full benchmark and return a results DataFrame.
@@ -163,7 +164,7 @@ class BenchmarkRunner:
             for algo in self.algorithms:
                 modal_runner.register_algorithm(algo)
             modal_runner._instances = self._instances
-            return asyncio.run(modal_runner.run())
+            return asyncio.run(modal_runner.run(progress_fn=progress_fn))
         if not self.algorithms:
             raise RuntimeError("No algorithms registered. Call register_algorithm() first.")
 
@@ -186,6 +187,7 @@ class BenchmarkRunner:
         records: list[BenchmarkResult] = []
 
         total = len(self.algorithms) * len(self._instances) * runs
+        runs_per_algo = len(self._instances) * runs
         
         # Use tqdm if available, otherwise just use silent iteration (logs will still be captured if error)
         iterable = self.algorithms
@@ -194,6 +196,7 @@ class BenchmarkRunner:
             pbar = tqdm(total=total, desc="Running Benchmark", unit="run")
 
         for algo in iterable:
+            algo_completed = 0
             for inst in self._instances:
                 for run_idx in range(runs):
                     inst_name = inst.get("instance_name", "unknown")
@@ -234,8 +237,14 @@ class BenchmarkRunner:
                         error_message=raw.get("error", ""),
                     ))
                     
+                    algo_completed += 1
                     if pbar:
                         pbar.update(1)
+                    if progress_fn:
+                        try:
+                            progress_fn(algo.name, algo_completed, runs_per_algo)
+                        except Exception:
+                            pass
 
         if pbar:
             pbar.close()

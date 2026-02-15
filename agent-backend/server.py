@@ -13,6 +13,7 @@ import logging
 import os
 import sys
 import tempfile
+import threading
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -208,6 +209,71 @@ def _build_chart(df: pd.DataFrame) -> Optional[BenchmarkResponse]:
 
 _SESSIONS: Dict[str, Dict[str, Any]] = {}  # session_id -> {agent, messages}
 
+from benchwarmer.database import init_db, save_message, get_messages
+
+# Initialize DB on startup
+@app.on_event("startup")
+def on_startup():
+    init_db()
+
+@app.get("/api/chat/{session_id}")
+async def get_chat_history(session_id: str):
+    """Retrieve chat history for a given session."""
+    messages = get_messages(session_id)
+    if not messages:
+        return [] 
+    return messages
+
+from benchwarmer.database import get_all_sessions, delete_session, rename_session
+
+@app.get("/api/sessions")
+async def get_sessions():
+    """Retrieve all chat sessions."""
+    return get_all_sessions()
+
+@app.delete("/api/sessions/{session_id}")
+async def remove_session(session_id: str):
+    """Delete a chat session and all its messages."""
+    delete_session(session_id)
+    _SESSIONS.pop(session_id, None)
+    return {"ok": True}
+
+@app.patch("/api/sessions/{session_id}")
+async def update_session(session_id: str, body: dict):
+    """Rename a chat session."""
+    title = body.get("title", "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Title required")
+    rename_session(session_id, title)
+    return {"ok": True}
+
+from benchwarmer.database import get_all_algorithms, get_algorithm_code
+
+@app.get("/api/algorithms")
+async def list_algorithms():
+    """Retrieve all generated algorithms."""
+    return get_all_algorithms()
+
+@app.get("/api/algorithms/{name}")
+async def get_algorithm(name: str):
+    """Retrieve code for a specific algorithm."""
+    code = get_algorithm_code(name)
+    if not code:
+        raise HTTPException(status_code=404, detail="Algorithm not found")
+    return {"name": name, "code": code}
+
+
+
+# ─── Session processing status ────────────────────────────────────────────────
+
+@app.get("/api/chat/{session_id}/status")
+async def get_chat_status(session_id: str):
+    """Check if the backend is still processing a turn for this session."""
+    sess = _SESSIONS.get(session_id)
+    if sess:
+        return {"processing": sess.get("processing", False)}
+    return {"processing": False}
+
 
 # ─── SSE Chat Endpoint ───────────────────────────────────────────────────────
 
@@ -215,6 +281,11 @@ _SESSIONS: Dict[str, Dict[str, Any]] = {}  # session_id -> {agent, messages}
 async def chat_turn(request: ChatRequest):
     """
     Multi-turn chat endpoint — mirrors the CLI orchestrator flow.
+
+    The orchestrator runs in a **background thread** that always saves
+    its result to the DB — even if the SSE client disconnects mid-stream
+    (e.g. browser refresh).  The SSE generator simply reads from the
+    shared event queue and forwards events to the client.
 
     Returns a **Server-Sent Events** stream with real-time progress:
         data: {"type": "thinking"}
@@ -230,6 +301,15 @@ async def chat_turn(request: ChatRequest):
     # ── Session setup (synchronous, before streaming) ──────────────────────
     if session_id and session_id in _SESSIONS:
         sess = _SESSIONS[session_id]
+        # If session is already processing a turn, reject the new request
+        if sess.get("processing", False):
+            async def busy_stream():
+                yield f"data: {_safe_json({'type': 'error', 'session_id': session_id, 'error': 'A turn is still being processed. Please wait.'})}\n\n"
+            return StreamingResponse(
+                busy_stream(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
         agent = sess["agent"]
         messages = sess["messages"]
     elif session_id and session_id not in _SESSIONS:
@@ -311,59 +391,148 @@ async def chat_turn(request: ChatRequest):
         session_id = str(uuid.uuid4())
         _SESSIONS[session_id] = {"agent": agent, "messages": messages}
 
-    # ── Streaming response ────────────────────────────────────────────────
+    # Save user message to DB
+    save_message(session_id, "user", request.message)
+
+    # ── Launch orchestrator in a background thread ─────────────────────────
+    # The thread always saves the result to DB when it finishes,
+    # regardless of whether the SSE client is still connected.
+
     loop = asyncio.get_running_loop()
     q: asyncio.Queue = asyncio.Queue()
-
-    # Track which tools are called this turn (thread-safe list append)
     _tools_called: list[str] = []
+
+    _last_tool_input: dict = {}
 
     def progress_cb(event: dict):
         """Called from the worker thread — enqueue event to the async queue."""
         if event.get("type") == "tool_start":
             _tools_called.append(event.get("tool", ""))
-        loop.call_soon_threadsafe(q.put_nowait, event)
+            _last_tool_input.clear()
+            _last_tool_input.update(event.get("input", {}))
+        try:
+            loop.call_soon_threadsafe(q.put_nowait, event)
+        except RuntimeError:
+            pass  # loop closed — SSE client gone, that's fine
 
-    # Capture in closure for the thread
+        # After intake completes, emit structured algorithm choices for the UI
+        if (
+            event.get("type") == "tool_end"
+            and event.get("tool") == "run_intake"
+            and agent is not None
+            and agent.state.algo_specs
+            and agent.state.preferred_algo_spec_indices is None
+        ):
+            algos = [
+                {
+                    "index": i,
+                    "name": s.name,
+                    "approach": s.approach,
+                    "source": s.source,
+                }
+                for i, s in enumerate(agent.state.algo_specs)
+            ]
+            try:
+                loop.call_soon_threadsafe(q.put_nowait, {
+                    "type": "algorithm_select",
+                    "algorithms": algos,
+                })
+            except RuntimeError:
+                pass
+
+        # After code_algorithm completes, emit algorithm_coded events (AI-coded only)
+        if (
+            event.get("type") == "tool_end"
+            and event.get("tool") == "code_algorithm"
+            and agent is not None
+            and agent.state.algorithms
+        ):
+            custom_name = agent.state.custom_algo_name
+            for algo_wrapper in agent.state.algorithms:
+                name = getattr(algo_wrapper, "name", None)
+                if name and name != custom_name:
+                    try:
+                        loop.call_soon_threadsafe(q.put_nowait, {
+                            "type": "algorithm_coded",
+                            "name": name,
+                        })
+                    except RuntimeError:
+                        pass
+
+        # After load_suite with list_suites=true, emit suite choices
+        if (
+            event.get("type") == "tool_end"
+            and event.get("tool") == "load_suite"
+            and agent is not None
+        ):
+            result_text = event.get("result", "")
+            if "Available benchmark suites" in result_text:
+                # Parse suite info from the tool result
+                import re as _re
+                suite_opts = []
+                for m in _re.finditer(
+                    r"•\s+(\w+):\s+(.+?)\((\d+)\s+instances?\)\s*\n\s+(.+)",
+                    result_text,
+                ):
+                    suite_opts.append({
+                        "value": m.group(1),
+                        "label": m.group(2).strip(),
+                        "description": f"{m.group(3)} instances — {m.group(4).strip()}",
+                    })
+                if suite_opts:
+                    try:
+                        loop.call_soon_threadsafe(q.put_nowait, {
+                            "type": "choice_prompt",
+                            "id": "benchmark_suite",
+                            "title": "Select a benchmark suite",
+                            "options": suite_opts,
+                            "multi_select": False,
+                        })
+                    except RuntimeError:
+                        pass
+            elif "Instances in" in result_text:
+                # Parse instance list from the tool result
+                import re as _re
+                inst_opts = []
+                for m in _re.finditer(
+                    r"•\s+([\w._-]+)\s+\((\d+)\s+nodes?\)",
+                    result_text,
+                ):
+                    inst_opts.append({
+                        "value": m.group(1),
+                        "label": m.group(1),
+                        "description": f"{m.group(2)} nodes",
+                    })
+                if inst_opts:
+                    try:
+                        loop.call_soon_threadsafe(q.put_nowait, {
+                            "type": "choice_prompt",
+                            "id": "benchmark_instances",
+                            "title": "Select instances to load",
+                            "options": inst_opts,
+                            "multi_select": True,
+                        })
+                    except RuntimeError:
+                        pass
+
+    # Mark session as actively processing
+    _SESSIONS[session_id]["processing"] = True
+    _SESSIONS[session_id]["event_queue"] = q
+
     _agent = agent
     _messages = messages
     _sid = session_id
     _user_msg = request.message
 
-    def blocking():
-        return _agent.run_one_turn(_messages, _user_msg, progress_cb=progress_cb)
-
-    async def event_stream():
-        task = loop.run_in_executor(None, blocking)
-
+    def _run_orchestrator():
+        """Blocking orchestrator work — runs in a daemon thread."""
         try:
-            # Stream events as they arrive from the orchestrator thread
-            while True:
-                try:
-                    event = await asyncio.wait_for(q.get(), timeout=2.0)
-                    yield f"data: {_safe_json(event)}\n\n"
-                except asyncio.TimeoutError:
-                    if task.done():
-                        break
-                    # Keep-alive heartbeat
-                    yield f"data: {_safe_json({'type': 'heartbeat'})}\n\n"
-
-            # Drain any remaining events
-            while not q.empty():
-                event = q.get_nowait()
-                yield f"data: {_safe_json(event)}\n\n"
-
-            # Get the final result
-            try:
-                msgs_out, reply = task.result()
-            except Exception as e:
-                logger.exception("Orchestrator error: %s", e)
-                yield f"data: {_safe_json({'type': 'error', 'session_id': _sid, 'error': str(e)})}\n\n"
-                return
-
+            msgs_out, reply = _agent.run_one_turn(
+                _messages, _user_msg, progress_cb=progress_cb
+            )
             _SESSIONS[_sid]["messages"] = msgs_out
 
-            # Attach plot image only when analyze_results was called & produced a file
+            # Handle plot image
             plot_image = None
             if "analyze_results" in _tools_called and _agent.state.last_plot_path:
                 plot_path = _agent.state.last_plot_path
@@ -372,11 +541,101 @@ async def chat_turn(request: ChatRequest):
                     with open(plot_path, "rb") as f:
                         encoded = _b64.b64encode(f.read()).decode("ascii")
                     plot_image = f"data:image/png;base64,{encoded}"
-                # Reset so it doesn't leak into subsequent turns
                 _agent.state.last_plot_path = None
 
-            yield f"data: {_safe_json({'type': 'done', 'session_id': _sid, 'reply': reply, 'plot_image': plot_image})}\n\n"
+            # Always persist to DB (even if the SSE client disconnected)
+            save_message(
+                session_id=_sid, role="assistant",
+                content=reply, tools=None, plot_image=plot_image,
+            )
 
+            # Emit interactive choice prompts based on pipeline state
+            # Only show instance source if code_algorithm was called this turn
+            # AND user didn't already specify an instance source preference
+            if (
+                "code_algorithm" in _tools_called
+                and _agent.state.instance_source is None
+                and _agent.state.preferred_instance_source is None
+                and _agent.state.algorithms
+                and len(_agent.state.algorithms) > 0
+            ):
+                gens = (
+                    _agent.state.config.instance_config.generators
+                    if _agent.state.config else []
+                )
+                gen_desc = ""
+                if gens:
+                    gen_names = [g.type for g in gens]
+                    gen_desc = f" ({', '.join(gen_names)})"
+                try:
+                    loop.call_soon_threadsafe(q.put_nowait, {
+                        "type": "choice_prompt",
+                        "id": "instance_source",
+                        "title": "How would you like to provide instances?",
+                        "options": [
+                            {
+                                "value": "generators",
+                                "label": "Generators",
+                                "description": f"Use proposed graph generators{gen_desc}",
+                            },
+                            {
+                                "value": "custom",
+                                "label": "Custom JSON",
+                                "description": "Load from your own instance file",
+                            },
+                            {
+                                "value": "benchmark suite",
+                                "label": "Benchmark Suite",
+                                "description": "Use standard benchmark instances (DIMACS, BiqMac, etc.)",
+                            },
+                        ],
+                        "multi_select": False,
+                    })
+                except RuntimeError:
+                    pass
+
+            # Notify queue — the SSE generator will pick this up if connected
+            try:
+                loop.call_soon_threadsafe(q.put_nowait, {
+                    "type": "done", "session_id": _sid,
+                    "reply": reply, "plot_image": plot_image,
+                })
+            except RuntimeError:
+                pass
+
+        except Exception as e:
+            logger.exception("Orchestrator error: %s", e)
+            try:
+                loop.call_soon_threadsafe(q.put_nowait, {
+                    "type": "error", "session_id": _sid, "error": str(e),
+                })
+            except RuntimeError:
+                pass
+        finally:
+            _SESSIONS[_sid]["processing"] = False
+
+    thread = threading.Thread(target=_run_orchestrator, daemon=True)
+    thread.start()
+
+    # ── SSE stream — just reads from the queue ────────────────────────────
+    async def event_stream():
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(q.get(), timeout=2.0)
+                    yield f"data: {_safe_json(event)}\n\n"
+                    # Terminal events — stop streaming
+                    if event.get("type") in ("done", "error"):
+                        break
+                except asyncio.TimeoutError:
+                    if not _SESSIONS.get(_sid, {}).get("processing", False):
+                        # Orchestrator finished while we weren't reading — drain
+                        while not q.empty():
+                            evt = q.get_nowait()
+                            yield f"data: {_safe_json(evt)}\n\n"
+                        break
+                    # Keep-alive heartbeat so proxies don't kill the connection
+                    yield f"data: {_safe_json({'type': 'heartbeat'})}\n\n"
         except Exception as e:
             logger.exception("Stream error: %s", e)
             yield f"data: {_safe_json({'type': 'error', 'session_id': _sid, 'error': str(e)})}\n\n"

@@ -134,7 +134,7 @@ class ModalRunner:
         logger.info("Generated %d instances", len(instances))
         return instances
 
-    async def run(self) -> pd.DataFrame:
+    async def run(self, progress_fn=None) -> pd.DataFrame:
         """
         Execute the full benchmark concurrently on Modal and return results.
 
@@ -188,6 +188,7 @@ class ModalRunner:
                     runs=runs,
                     timeout=timeout,
                     existing_sandbox=existing_sb,
+                    progress_fn=progress_fn,
                 )
             )
 
@@ -271,6 +272,7 @@ class ModalRunner:
         runs: int,
         timeout: float,
         existing_sandbox=None,
+        progress_fn=None,
     ) -> list[tuple[dict, dict, int]]:
         """
         Run ALL instances × runs for a single algorithm inside ONE sandbox.
@@ -327,6 +329,11 @@ class ModalRunner:
                             "%s: %d/%d runs complete",
                             algo_name, completed, total_runs,
                         )
+                    if progress_fn:
+                        try:
+                            progress_fn(algo_name, completed, total_runs)
+                        except Exception:
+                            pass
 
         except Exception as exc:
             logger.error("Sandbox for '%s' failed: %s", algo_name, exc)

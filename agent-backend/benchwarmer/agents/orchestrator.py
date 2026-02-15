@@ -42,6 +42,9 @@ class PipelineState:
     preferred_runs_per_instance: int | None = None
     preferred_algo_spec_indices: list[int] | None = None  # e.g. [0, 2]
     preferred_plot_requests: list[str] | None = None  # NL descriptions to plot after benchmark
+    preferred_instance_source: str | None = None  # "generator" | "custom" | "suite" | None
+    preferred_suite_key: str | None = None  # e.g. "biqmac", "dimacs"
+    preferred_instance_names: list[str] | None = None  # e.g. ["g05_60.0", "g05_80.0"]
 
     def summary(self) -> str:
         """Human-readable summary for the LLM system prompt."""
@@ -72,9 +75,18 @@ class PipelineState:
             lines.append(f"User requested runs per instance: {self.preferred_runs_per_instance} (already applied)")
         if self.preferred_plot_requests:
             lines.append(f"User requested plots (generate after benchmark): {', '.join(self.preferred_plot_requests)}")
+        if self.preferred_instance_source and not self.instance_source:
+            src = self.preferred_instance_source
+            msg = f"User requested instance source: {src}"
+            if src == "suite" and self.preferred_suite_key:
+                msg += f" (suite: {self.preferred_suite_key})"
+                if self.preferred_instance_names:
+                    msg += f" with instances: {', '.join(self.preferred_instance_names)}"
+            msg += " — apply this automatically using the appropriate tool WITHOUT asking."
+            lines.append(msg)
 
         if self.algo_specs:
-            specs = [f"[{i}] {s.name} ({s.source})" for i, s in enumerate(self.algo_specs)]
+            specs = [f"{i}. {s.name} ({s.source})" for i, s in enumerate(self.algo_specs)]
             lines.append(f"Paper algorithms (extracted, not yet coded): {', '.join(specs)}")
             if self.preferred_algo_spec_indices is not None:
                 lines.append(f"User requested algorithms (by index): {self.preferred_algo_spec_indices} — call code_algorithm with these indices without asking.")
@@ -321,9 +333,9 @@ natural language and you use your tools to take actions. You should be helpful, 
 concise, and proactive.
 
 ## Pipeline Steps (order matters after intake)
-1. **Intake**: Analyze the problem description (+ optional PDFs) → BenchmarkConfig + AlgorithmSpecs. The user may also specify in the same message: runs per instance, which algorithms to implement, and which plots they want — these are carried forward so you do not ask again.
+1. **Intake**: Analyze the problem description (+ optional PDFs) → BenchmarkConfig + AlgorithmSpecs. The user may also specify in the same message: runs per instance, which algorithms to implement, which instances/suite to use, and which plots they want — these are ALL carried forward so you do not ask again.
 2. **Which algorithms to implement**: If state shows "User requested algorithms (by index)", call code_algorithm with those indices immediately — do NOT ask. If paper algorithms exist AND the user uploaded PDFs, implement ALL paper algorithm after asking, and confirming— call code_algorithm with all indicec. If more than 1 algorithm is present, always prompt the user to confirm which algorithms to run.
-3. **Instance source** (REQUIRED before benchmark): The user MUST choose one: generator, custom, or suite (see tools).
+3. **Instance source** (REQUIRED before benchmark): If state shows "User requested instance source", apply it immediately using the appropriate tool (use_generators, load_suite, load_custom_instances) WITHOUT asking. For suites: if suite_key is specified, call load_suite with that key; if instance_names are also specified, call load_suite with those names directly; otherwise list instances and let user pick. If no preference, the user MUST choose one: generator, custom, or suite (see tools).
 4. **Configure**: Modify generators/instances, execution settings
 5. **Benchmark**: Run the benchmark → you receive a **summary table** with avg runtime, avg memory, success rate per algorithm. Present this table to the user verbatim (keep the markdown table format). No charts are generated at this stage.
 6. **Analysis**: After presenting the benchmark summary table, ask: "Would you like any plots or visualizations of these results?" Only call analyze_results when the user explicitly says yes or requests specific plots. If state shows "User requested plots (generate after benchmark)", call analyze_results for EACH requested plot after asking the user, then ask if they want more.
@@ -331,8 +343,9 @@ concise, and proactive.
 ## Key Behaviors
 - **Short replies like "0", "1", "0 2", "all", "generators", "yes", "run" are ANSWERS to your previous question.** Interpret them in context of what you last asked. For example, if you asked "Which algorithms do you want me to implement?" and the user replies "0", that means "implement algorithm at index 0" — call code_algorithm with spec_indices=[0]. If you asked about instance source and the user replies "generators", call use_generators. NEVER ask for clarification when the user gives a clear index or keyword.
 - When "User requested algorithms (by index)" is in state, call code_algorithm with that list without asking. When "User requested plots" is in state, after run_benchmark call analyze_results for each listed request, then ask if they want more.
-- When "Instance source: NOT CHOSEN" appears in state, ask the user to choose: generator, custom JSON file, or benchmark suite. Do NOT call use_generators until the user explicitly chooses generators.
-- When using load_suite: after you list instances (first call with empty instance_names), you MUST wait for the user to tell you which instance names to load. Do NOT call load_suite again with all names — only pass the instance_names the user asked for. If the user says "all" or "load all", then you may pass the full list.
+- When "User requested instance source" is in state, act on it immediately without asking: call use_generators, load_suite (with suite_key and optionally instance_names), or load_custom_instances as appropriate. Do NOT ask the user to confirm — they already specified this.
+- When "Instance source: NOT CHOSEN" appears in state AND no instance preference exists, ask the user to choose: generator, custom JSON file, or benchmark suite. Do NOT call use_generators until the user explicitly chooses generators.
+- When using load_suite: after you list instances (first call with empty instance_names), you MUST wait for the user to tell you which instance names to load. Do NOT call load_suite again with all names — only pass the instance_names the user asked for. If the user says "all" or "load all", then you may pass the full list. Exception: if state has preferred_instance_names, load those directly.
 - Do NOT call analyze_results unless the user explicitly asks for a plot/chart/visualization. Exception: if state lists "User requested plots", ask the user to confirm, then call analyze_results for each.
 - After run_benchmark, you get a markdown summary table. Present it to the user EXACTLY (keep the | table format). Then ask "Would you like any plots or visualizations?" Do NOT generate plots automatically.
 - The user can go back to any step at any time
@@ -353,20 +366,34 @@ concise, and proactive.
 
 def _extract_user_preferences(backend: Any, user_message: str, algo_specs: list) -> dict[str, Any]:
     """
-    Extract runs_per_instance, algo_indices, and plot_requests from the user's
-    message so we can carry them forward without asking again.
-    Returns dict with keys: runs_per_instance (int|None), algo_indices (list[int]|None), plot_requests (list[str]|None).
+    Extract runs_per_instance, algo_indices, plot_requests, instance_source,
+    suite_key, and instance_names from the user's message so we can carry them
+    forward without asking again.
     """
     if not user_message.strip():
-        return {"runs_per_instance": None, "algo_indices": None, "plot_requests": None}
+        return {
+            "runs_per_instance": None, "algo_indices": None, "plot_requests": None,
+            "instance_source": None, "suite_key": None, "instance_names": None,
+        }
 
     algo_list = "\n".join(f"  [{i}] {s.name}" for i, s in enumerate(algo_specs)) if algo_specs else "(none)"
+
+    # Get available suite keys for the LLM to match against
+    try:
+        from benchwarmer.utils.benchmark_suites import list_suites
+        suites = list_suites()
+        suite_info = "\n".join(f"  - {s['key']}: {s['name']} ({s['instance_count']} instances)" for s in suites)
+    except Exception:
+        suite_info = "(none available)"
 
     system = """You extract structured preferences from the user's message. Reply with ONLY a single JSON object, no markdown, no explanation.
 Use these exact keys:
 - "runs_per_instance": integer or null (e.g. 5, 10 if they said "5 runs", "10 trials per instance")
-- "algo_indices": list of 0-based integers or null (which paper algorithms to implement; if they say "all" use null to mean ask later; if they name algorithms match by name to index)
+- "algo_indices": list of 0-based integers or null (which paper algorithms to implement; if they say "all" return all valid indices as a list; if they name algorithms match by name to index; if not mentioned use null)
 - "plot_requests": list of strings or null (each string is a natural-language plot/visualization request, e.g. "bar chart of runtimes", "scatter objective vs size")
+- "instance_source": one of "generator", "suite", "custom" or null. "generator" if they mention generators/generate instances; "suite" if they mention benchmark suite, biqmac, dimacs, or any known suite name; "custom" if they mention custom JSON/file.
+- "suite_key": string or null — the suite key if they mentioned a specific suite (match against available suites below). e.g. "biqmac", "dimacs".
+- "instance_names": list of strings or null — specific instance names if mentioned (e.g. ["g05_60.0", "g05_80.0"]).
 If something is not mentioned, use null for that key."""
 
     user_content = f"""User message:
@@ -375,7 +402,10 @@ If something is not mentioned, use null for that key."""
 Paper algorithms (by index):
 {algo_list}
 
-Extract runs_per_instance, algo_indices, and plot_requests. Output only the JSON object."""
+Available benchmark suites:
+{suite_info}
+
+Extract all preferences. Output only the JSON object."""
 
     try:
         response = backend.generate(
@@ -398,23 +428,57 @@ Extract runs_per_instance, algo_indices, and plot_requests. Output only the JSON
                     text = text[start:(end if end != -1 else None)].strip()
                     break
         data = json.loads(text)
+
+        # -- runs_per_instance --
         runs = data.get("runs_per_instance")
         if runs is not None and not isinstance(runs, int):
             runs = int(runs) if isinstance(runs, (float, str)) and str(runs).isdigit() else None
+
+        # -- algo_indices --
         indices = data.get("algo_indices")
         if indices is not None and not isinstance(indices, list):
             indices = None
         if indices is not None:
             indices = [int(i) for i in indices if isinstance(i, (int, float)) or (isinstance(i, str) and i.isdigit())]
+
+        # -- plot_requests --
         plots = data.get("plot_requests")
         if plots is not None and not isinstance(plots, list):
             plots = [str(plots)] if plots else None
         if plots is not None:
             plots = [str(p).strip() for p in plots if p]
-        return {"runs_per_instance": runs, "algo_indices": indices if indices else None, "plot_requests": plots or None}
+
+        # -- instance_source --
+        inst_src = data.get("instance_source")
+        if inst_src not in ("generator", "suite", "custom"):
+            inst_src = None
+
+        # -- suite_key --
+        suite_key = data.get("suite_key")
+        if suite_key is not None and not isinstance(suite_key, str):
+            suite_key = None
+
+        # -- instance_names --
+        inst_names = data.get("instance_names")
+        if inst_names is not None and not isinstance(inst_names, list):
+            inst_names = None
+        if inst_names is not None:
+            inst_names = [str(n).strip() for n in inst_names if n]
+
+        return {
+            "runs_per_instance": runs,
+            "algo_indices": indices if indices else None,
+            "plot_requests": plots or None,
+            "instance_source": inst_src,
+            "suite_key": suite_key if inst_src == "suite" else None,
+            "instance_names": inst_names or None,
+        }
     except Exception as e:
         logger.warning("Could not extract user preferences: %s", e)
-        return {"runs_per_instance": None, "algo_indices": None, "plot_requests": None}
+        return {
+            "runs_per_instance": None, "algo_indices": None, "plot_requests": None,
+            "instance_source": None, "suite_key": None, "instance_names": None,
+        }
 
 
 # ──────────────────────────────────────────────────────────────
@@ -454,6 +518,7 @@ class OrchestratorAgent:
         self.plot_index = 0
         self._plot_agent = None
         self._impl_agent = None
+        self._progress_cb = None
 
         # Load custom algorithm if provided
         if self.state.custom_algo_path:
@@ -489,6 +554,9 @@ class OrchestratorAgent:
             {"type": "tool_end",   "tool": <name>, "result": <str>}
         """
         messages.append({"role": "user", "content": user_message})
+
+        # Store progress_cb so tool handlers (like _tool_run_benchmark) can emit events
+        self._progress_cb = progress_cb
 
         system = ORCHESTRATOR_SYSTEM_PROMPT.format(
             state_summary=self.state.summary(),
@@ -723,6 +791,9 @@ class OrchestratorAgent:
         self.state.preferred_runs_per_instance = prefs.get("runs_per_instance")
         self.state.preferred_algo_spec_indices = prefs.get("algo_indices")
         self.state.preferred_plot_requests = prefs.get("plot_requests")
+        self.state.preferred_instance_source = prefs.get("instance_source")
+        self.state.preferred_suite_key = prefs.get("suite_key")
+        self.state.preferred_instance_names = prefs.get("instance_names")
         if self.state.preferred_runs_per_instance is not None:
             self.state.config.execution_config.runs_per_config = self.state.preferred_runs_per_instance
 
@@ -742,13 +813,21 @@ class OrchestratorAgent:
             lines.append(f"   Will implement: {', '.join(names)} (from your message)")
         if self.state.preferred_plot_requests:
             lines.append(f"   Will generate these plots after benchmark: {', '.join(self.state.preferred_plot_requests)}")
+        if self.state.preferred_instance_source:
+            src = self.state.preferred_instance_source
+            msg = f"   Will use instance source: {src}"
+            if src == "suite" and self.state.preferred_suite_key:
+                msg += f" (suite: {self.state.preferred_suite_key})"
+                if self.state.preferred_instance_names:
+                    msg += f" → instances: {', '.join(self.state.preferred_instance_names)}"
+            lines.append(f"{msg} (from your message)")
 
         if self.state.algo_specs:
             lines.append(f"\n📋 Extracted {len(self.state.algo_specs)} algorithm(s) from papers:")
             for i, spec in enumerate(self.state.algo_specs):
-                lines.append(f"   [{i}] {spec.name}: {spec.approach} (source: {spec.source})")
+                lines.append(f"   {i}. **{spec.name}**: {spec.approach} (source: {spec.source})")
 
-        if not self.state.instance_source:
+        if not self.state.instance_source and not self.state.preferred_instance_source:
             lines.append("\nHow would you like to provide instances? (generator / custom JSON / benchmark suite)")
 
         return "\n".join(lines)
@@ -839,7 +918,15 @@ class OrchestratorAgent:
                 )
                 if result["success"]:
                     self.state.algorithms.append(result["algorithm"])
-                    results_msgs.append(f"✅ {result['name']} coded and tested!")
+                    
+                    # Save to DB
+                    from benchwarmer.database import save_algorithm
+                    try:
+                        save_algorithm(result["name"], result["code"])
+                        results_msgs.append(f"✅ {result['name']} coded, tested, and saved to DB!")
+                    except Exception as e:
+                        results_msgs.append(f"✅ {result['name']} coded and tested, but failed to save to DB: {e}")
+
                 else:
                     results_msgs.append(f"❌ {spec.name} failed: {result['error']}")
 
@@ -894,16 +981,38 @@ class OrchestratorAgent:
             pool = SandboxPool()
             self.state.pool = pool
 
+        # Generate instances up front so we know the count before run()
+        if not runner._instances:
+            runner.generate_instances()
+
         algo_names = [a.name for a in self.state.algorithms]
-        total_inst = sum(
-            len(g.sizes) * g.count_per_size
-            for g in self.state.config.instance_config.generators
-        )
+        total_inst = len(runner._instances)
         runs = self.state.config.execution_config.runs_per_config
         print(f"  🚀 Running benchmark ({mode}): {len(algo_names)} algos × {total_inst} instances × {runs} runs")
 
+        # Emit benchmark_start event via progress_cb
+        runs_per_algo = total_inst * runs
+        if self._progress_cb:
+            self._progress_cb({
+                "type": "benchmark_start",
+                "algorithms": [
+                    {"name": a.name, "total_runs": runs_per_algo}
+                    for a in self.state.algorithms
+                ],
+            })
+
+        # Create a progress callback for the runner
+        def _bench_progress(algo_name, completed, total):
+            if self._progress_cb:
+                self._progress_cb({
+                    "type": "benchmark_progress",
+                    "algorithm": algo_name,
+                    "completed": completed,
+                    "total": total,
+                })
+
         try:
-            df = runner.run(execution_mode=mode, sandbox_pool=pool)
+            df = runner.run(execution_mode=mode, sandbox_pool=pool, progress_fn=_bench_progress)
         except Exception as e:
             return f"❌ Benchmark failed: {e}"
         finally:
@@ -914,6 +1023,10 @@ class OrchestratorAgent:
                     pass
 
         self.state.results = df
+
+        # Emit benchmark_complete event
+        if self._progress_cb:
+            self._progress_cb({"type": "benchmark_complete"})
 
         # ── Build CLI-style summary table ──────────────────────────────
         import pandas as _pd
