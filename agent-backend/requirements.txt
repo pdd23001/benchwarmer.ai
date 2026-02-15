@@ -20,3 +20,9 @@ python-dotenv>=1.0.0
 
 # Modal sandbox (remote execution)
 modal>=0.70
+
+# PDF text extraction (Nemotron fallback)
+PyMuPDF>=1.24
+
+# OpenAI-compatible backends (Nemotron)
+openai>=1.0

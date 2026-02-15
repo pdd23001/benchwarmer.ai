@@ -313,12 +313,20 @@ class ModalRunner:
                 algo_name, len(instances), runs,
             )
 
+            total_runs = len(instances) * runs
+            completed = 0
             for inst in instances:
                 for run_idx in range(runs):
                     raw = await self._exec_single_run(
                         sb, inst, timeout, algo_name, run_idx,
                     )
                     results.append((raw, inst, run_idx))
+                    completed += 1
+                    if completed % 10 == 0 or completed == total_runs:
+                        logger.info(
+                            "%s: %d/%d runs complete",
+                            algo_name, completed, total_runs,
+                        )
 
         except Exception as exc:
             logger.error("Sandbox for '%s' failed: %s", algo_name, exc)

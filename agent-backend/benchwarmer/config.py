@@ -101,6 +101,24 @@ class BenchmarkConfig(BaseModel):
     )
 
 
+class AlgorithmSpec(BaseModel):
+    """Structured algorithm description extracted by IntakeAgent from papers or user input."""
+    name: str = Field(..., description="Snake_case identifier, e.g. 'spectral_partitioning'")
+    approach: str = Field(..., description="One-line summary of the algorithm's approach")
+    complexity: str = Field(default="unknown", description="Time complexity, e.g. 'O(n^2)'")
+    key_steps: list[str] = Field(
+        default_factory=list,
+        description="Pseudocode-like steps for the algorithm",
+    )
+    source: str = Field(default="user", description="Where this came from, e.g. 'paper.pdf'")
+
+
+class IntakeResult(BaseModel):
+    """Complete output from IntakeAgent: benchmark config + algorithm specs."""
+    config: BenchmarkConfig
+    algorithms: list[AlgorithmSpec] = Field(default_factory=list)
+
+
 # ---------------------------------------------------------------------------
 # Result record
 # ---------------------------------------------------------------------------

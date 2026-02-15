@@ -36,7 +36,11 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="Benchwarmer.AI")
     parser.add_argument("--custom", "-c", type=str, help="Path to custom algorithm file to benchmark against.")
+    parser.add_argument("--papers", "-p", nargs="+", type=str, help="PDF papers to analyze for algorithm extraction.")
     parser.add_argument("--mode", "-m", type=str, default="local", choices=["local", "modal"], help="Execution mode: 'local' (default) or 'modal' (remote sandbox).")
+    parser.add_argument("--intake-backend", type=str, default="claude", choices=["claude", "nemotron"], help="LLM backend for Intake Agent.")
+    parser.add_argument("--nemotron-url", type=str, default="https://integrate.api.nvidia.com/v1", help="Base URL for Nemotron/OpenAI-compatible backend.")
+    parser.add_argument("--nemotron-model", type=str, default="nvidia/nemotron-3-nano-30b-a3b", help="Model name for Nemotron backend.")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -87,11 +91,51 @@ def main() -> None:
 
     # ── Step 2: Intake Agent → BenchmarkConfig (proposal) ────
     from benchwarmer.agents.intake import IntakeAgent
+    from benchwarmer.agents.backends import ClaudeBackend, OpenAIBackend
 
-    agent = IntakeAgent()
-    config = agent.run(description)
+    backend = None
+    if args.intake_backend == "nemotron":
+        print(f"🔹 Using Nemotron backend: {args.nemotron_model} at {args.nemotron_url}")
+        try:
+            backend = OpenAIBackend(
+                base_url=args.nemotron_url,
+                model=args.nemotron_model,
+            )
+        except ImportError as e:
+            print(f"❌ {e}")
+            sys.exit(1)
+    else:
+        # Default to Claude
+        try:
+            backend = ClaudeBackend()
+        except ImportError as e:
+            print(f"❌ {e}")
+            sys.exit(1)
 
-    print("\n✅ BenchmarkConfig proposed!")
+    agent = IntakeAgent(backend=backend)
+
+    # Validate PDF paths if provided
+    pdf_paths = None
+    if args.papers:
+        pdf_paths = []
+        for p in args.papers:
+            if os.path.exists(p):
+                pdf_paths.append(p)
+                print(f"  📄 {os.path.basename(p)}")
+            else:
+                print(f"  ❌ Not found: {p}")
+        if not pdf_paths:
+            pdf_paths = None
+
+    result = agent.run(description, pdf_paths=pdf_paths)
+    config = result.config
+    algo_specs = result.algorithms
+
+    print("\n✅ IntakeResult received!")
+    if algo_specs:
+        print(f"   📋 {len(algo_specs)} algorithm(s) extracted from papers:")
+        for spec in algo_specs:
+            print(f"      • {spec.name}: {spec.approach} (source: {spec.source})")
     print("-" * 60)
 
     # ── Step 3: Instance source selection ────────────────────
@@ -105,8 +149,94 @@ def main() -> None:
         print("\n🔧 Modal mode: sandboxes will be created for each algorithm")
         print("   and reused for benchmarking.\n")
 
+    # ── Step 3.6: Select & code extracted algorithms ────────────
+    auto_coded = []
+    if algo_specs:
+        print()
+        print("=" * 60)
+        print("  📄 Algorithms Extracted from Papers")
+        print("=" * 60)
+        print()
+
+        for i, spec in enumerate(algo_specs, 1):
+            print(f"  [{i}] {spec.name}")
+            print(f"      Approach: {spec.approach}")
+            print(f"      Complexity: {spec.complexity}")
+            print(f"      Source: {spec.source}")
+            if spec.key_steps:
+                print(f"      Steps: {spec.key_steps[0]}", end="")
+                if len(spec.key_steps) > 1:
+                    print(f" (+{len(spec.key_steps)-1} more)")
+                else:
+                    print()
+            print()
+
+        print("  Which algorithms would you like to code?")
+        print("  Enter numbers (e.g. 1,3), 'all', or 'none':")
+        choice = input("\n  ➤ ").strip().lower()
+
+        # Parse selection
+        selected_specs = []
+        if choice == "all":
+            selected_specs = list(algo_specs)
+        elif choice in ("none", "n", "0", ""):
+            selected_specs = []
+        else:
+            try:
+                indices = [int(x.strip()) for x in choice.split(",")]
+                for idx in indices:
+                    if 1 <= idx <= len(algo_specs):
+                        selected_specs.append(algo_specs[idx - 1])
+                    else:
+                        print(f"  ⚠️  Skipping invalid index: {idx}")
+            except ValueError:
+                print("  ⚠️  Could not parse selection. Skipping all.")
+
+        if selected_specs:
+            from benchwarmer.agents.implementation import ImplementationAgent
+            impl_agent = ImplementationAgent()
+
+            print(f"\n  🤖 Coding {len(selected_specs)} selected algorithm(s)…\n")
+
+            for spec in selected_specs:
+                print(f"  Coding '{spec.name}' ({spec.source})…")
+                spec_prompt = (
+                    f"Implement this algorithm: {spec.name}\n\n"
+                    f"Approach: {spec.approach}\n"
+                    f"Complexity: {spec.complexity}\n\n"
+                    f"Key steps:\n"
+                )
+                for i, step in enumerate(spec.key_steps, 1):
+                    spec_prompt += f"  {i}. {step}\n"
+
+                result = impl_agent.generate(
+                    description=spec_prompt,
+                    problem_class=config.problem_class,
+                    pool=pool,
+                )
+
+                if result["success"]:
+                    print(f"  ✅ {result['name']} generated and tested!")
+                    auto_coded.append(result["algorithm"])
+                else:
+                    print(f"  ❌ Failed: {result['error']}")
+                    print(f"     You can try implementing it manually below.")
+        else:
+            print("\n  Skipping paper algorithms.")
+
     # ── Step 4: Register algorithms ─────────────────────────
-    algorithms = _algorithm_registration(config, initial_algorithms=init_algorithms, pool=pool)
+    # Merge: custom + auto-coded + builtins
+    combined_init = []
+    if init_algorithms:
+        combined_init.extend(init_algorithms)
+    if auto_coded:
+        combined_init.extend(auto_coded)
+
+    algorithms = _algorithm_registration(
+        config,
+        initial_algorithms=combined_init if combined_init else None,
+        pool=pool,
+    )
 
     if not algorithms:
         print("⚠️  No algorithms registered. Exiting.")
@@ -193,7 +323,7 @@ def _generator_flow(config):
         print(f"  Timeout: {config.execution_config.timeout_seconds}s")
         print()
 
-        action = input("Accept this configuration? (yes/modify/add/remove): ").strip().lower()
+        action = input("Accept this configuration? (yes/modify/add/remove/config): ").strip().lower()
 
         if action in ("yes", "y", ""):
             break
@@ -203,15 +333,53 @@ def _generator_flow(config):
             _add_generator(generators)
         elif action in ("remove", "r", "delete"):
             _remove_generator(generators)
+        elif action in ("config", "c", "cfg"):
+            ec = config.execution_config
+            print(f"\n   Current runs_per_instance: {ec.runs_per_config}")
+            print(f"   Current timeout: {ec.timeout_seconds}s")
+            print(f"   Current memory_limit: {ec.memory_limit_mb} MB\n")
+            new_runs = input("   Runs per instance (or Enter to keep): ").strip()
+            if new_runs:
+                try:
+                    ec.runs_per_config = int(new_runs)
+                except ValueError:
+                    print("   ⚠️  Invalid number.")
+            new_timeout = input("   Timeout seconds (or Enter to keep): ").strip()
+            if new_timeout:
+                try:
+                    ec.timeout_seconds = float(new_timeout)
+                except ValueError:
+                    print("   ⚠️  Invalid number.")
+            print(f"   ✅ Execution config updated.")
         else:
-            print("   Please enter 'yes', 'modify', 'add', or 'remove'.")
+            print("   Please enter 'yes', 'modify', 'add', 'remove', or 'config'.")
 
     print("✅ Generator configuration confirmed!")
     return config
 
 
+def _nl_to_json(prompt: str) -> str | None:
+    """Quick LLM call to interpret natural language into JSON/value."""
+    try:
+        from benchwarmer.agents.backends import ClaudeBackend
+        backend = ClaudeBackend()
+        response = backend.generate(
+            messages=[{"role": "user", "content": prompt}],
+            system="You are a concise helper. Return ONLY the requested value — no explanation, no markdown, no code fences.",
+            max_tokens=256,
+        )
+        text = ""
+        for block in response.content:
+            if hasattr(block, "text"):
+                text += block.text
+        return text.strip()
+    except Exception as e:
+        logging.getLogger(__name__).debug("NL interpretation failed: %s", e)
+        return None
+
+
 def _modify_generator(generators: list):
-    """Let user modify params of a specific generator."""
+    """Let user modify params of a specific generator. Accepts JSON or natural language."""
     from benchwarmer.config import GeneratorConfig
 
     if not generators:
@@ -233,30 +401,72 @@ def _modify_generator(generators: list):
     print(f"   Current sizes:  {g.sizes}")
     print(f"   Current count:  {g.count_per_size}")
     print()
+    print("   💡 You can type JSON or natural language (e.g. 'make it denser')")
+    print()
 
     # Modify params
-    new_params = input("   New params (JSON, or Enter to keep): ").strip()
+    new_params = input("   New params (JSON/NL, or Enter to keep): ").strip()
     if new_params:
         try:
             g.params = json.loads(new_params)
         except json.JSONDecodeError:
-            print("   ⚠️  Invalid JSON — keeping existing params.")
+            # Treat as natural language → ask LLM to interpret
+            interpreted = _nl_to_json(
+                f"Generator type: {g.type}\n"
+                f"Current params: {json.dumps(g.params)}\n"
+                f"User request: {new_params}\n\n"
+                f"Return ONLY valid JSON for the updated params dict. "
+                f"No explanation, just the JSON object."
+            )
+            if interpreted:
+                try:
+                    g.params = json.loads(interpreted)
+                    print(f"   ✨ Interpreted: {json.dumps(g.params)}")
+                except json.JSONDecodeError:
+                    print("   ⚠️  Could not interpret — keeping existing params.")
+            else:
+                print("   ⚠️  Could not interpret — keeping existing params.")
 
     # Modify sizes
-    new_sizes = input("   New sizes (comma-separated, or Enter to keep): ").strip()
+    new_sizes = input("   New sizes (numbers/NL, or Enter to keep): ").strip()
     if new_sizes:
         try:
             g.sizes = [int(s.strip()) for s in new_sizes.split(",")]
         except ValueError:
-            print("   ⚠️  Invalid sizes — keeping existing.")
+            # Treat as NL
+            interpreted = _nl_to_json(
+                f"Current sizes: {g.sizes}\n"
+                f"User request: {new_sizes}\n\n"
+                f"Return ONLY a JSON array of integer sizes. No explanation."
+            )
+            if interpreted:
+                try:
+                    g.sizes = json.loads(interpreted)
+                    print(f"   ✨ Interpreted: {g.sizes}")
+                except (json.JSONDecodeError, TypeError):
+                    print("   ⚠️  Could not interpret — keeping existing sizes.")
+            else:
+                print("   ⚠️  Could not interpret — keeping existing sizes.")
 
     # Modify count
-    new_count = input("   New count_per_size (or Enter to keep): ").strip()
+    new_count = input("   New count_per_size (number/NL, or Enter to keep): ").strip()
     if new_count:
         try:
             g.count_per_size = int(new_count)
         except ValueError:
-            print("   ⚠️  Invalid count — keeping existing.")
+            interpreted = _nl_to_json(
+                f"Current count_per_size: {g.count_per_size}\n"
+                f"User request: {new_count}\n\n"
+                f"Return ONLY a single integer. No explanation."
+            )
+            if interpreted:
+                try:
+                    g.count_per_size = int(interpreted.strip())
+                    print(f"   ✨ Interpreted: {g.count_per_size}")
+                except ValueError:
+                    print("   ⚠️  Could not interpret — keeping existing count.")
+            else:
+                print("   ⚠️  Could not interpret — keeping existing count.")
 
     print(f"   ✅ Generator #{idx} updated.")
 
