@@ -101,7 +101,7 @@ function ParsedMessageContent({ content }: { content: string }) {
     if (parts.length === 0)
         return (
             <div className="prose-chat">
-                <ReactMarkdown>{content}</ReactMarkdown>
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
             </div>
         )
 
@@ -126,7 +126,7 @@ function ParsedMessageContent({ content }: { content: string }) {
                 }
                 return (
                     <div key={i} className="prose-chat">
-                        <ReactMarkdown>{part.content}</ReactMarkdown>
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}>{part.content}</ReactMarkdown>
                     </div>
                 )
             })}
