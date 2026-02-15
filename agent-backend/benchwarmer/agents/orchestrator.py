@@ -47,7 +47,7 @@ class PipelineState:
             if self.instance_source:
                 lines.append(f"Instance source: {self.instance_source}")
             else:
-                lines.append("Instance source: NOT CHOSEN (ask user: generator, custom JSON, or benchmark suite)")
+                lines.append("Instance source: NOT CHOSEN — YOU MUST ASK: 'Use generators, custom JSON file, or benchmark suite?' Do NOT call use_generators until user chooses.")
 
             gens = c.instance_config.generators
             if gens:
@@ -63,8 +63,10 @@ class PipelineState:
             lines.append("Config: NOT SET (run intake first)")
 
         if self.algo_specs:
-            specs = [f"{s.name} ({s.source})" for s in self.algo_specs]
+            specs = [f"[{i}] {s.name} ({s.source})" for i, s in enumerate(self.algo_specs)]
             lines.append(f"Paper algorithms (extracted, not yet coded): {', '.join(specs)}")
+            if not self.algorithms or len(self.algorithms) <= (1 if self.custom_algo_name else 0):
+                lines.append("ACTION REQUIRED: Ask user 'Which of these do you want me to implement? (Reply by index, e.g. 0, 1, or 0 2, or all)' BEFORE asking about instance source.")
 
         if self.algorithms:
             algo_names = [a.name for a in self.algorithms]
@@ -141,14 +143,14 @@ ORCHESTRATOR_TOOLS = [
     },
     {
         "name": "code_algorithm",
-        "description": "Use the ImplementationAgent to generate code for an algorithm. Can ONLY be called with an index referencing a paper algorithm spec.",
+        "description": "Generate and register code for paper-extracted algorithm(s). Call ONLY after the user has told you which algorithm(s) to implement (by index). Do not call before asking the user which of the listed paper algorithms they want.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "spec_indices": {
                     "type": "array",
                     "items": {"type": "integer"},
-                    "description": "0-based indices into algo_specs to code from paper extractions.",
+                    "description": "0-based indices into algo_specs (e.g. [0, 2] for first and third).",
                 },
             },
             "required": ["spec_indices"],
@@ -189,13 +191,13 @@ ORCHESTRATOR_TOOLS = [
     },
     {
         "name": "analyze_results",
-        "description": "Generate a visualization or analysis of benchmark results using the PlotAgent. Requires benchmark to have been run.",
+        "description": "Generate a visualization or analysis of benchmark results. Call ONLY when the user explicitly asks for a plot, chart, or analysis (e.g. 'plot a bar chart', 'show me runtime comparison'). Do NOT call automatically after run_benchmark — wait for the user to request a visualization.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "request": {
                     "type": "string",
-                    "description": "The visualization/analysis request (e.g. 'bar chart comparing algorithms').",
+                    "description": "The user's visualization/analysis request (e.g. 'bar chart comparing algorithms'). Use what the user asked for, not a default.",
                 },
             },
             "required": ["request"],
@@ -247,7 +249,7 @@ ORCHESTRATOR_TOOLS = [
     },
     {
         "name": "use_generators",
-        "description": "Confirm using the proposed generators as the instance source (this is set after intake). Call this when the user chooses generators.",
+        "description": "Set instance source to generators. ONLY call this when the user has explicitly said they want to use the proposed generators. Do NOT call by default after intake — ask the user first to choose: generators, custom file, or suite.",
         "input_schema": {
             "type": "object",
             "properties": {},
@@ -255,7 +257,7 @@ ORCHESTRATOR_TOOLS = [
     },
     {
         "name": "load_custom_instances",
-        "description": "Load custom graph instances from a JSON file. Use when user wants to provide their own instances.",
+        "description": "Set instance source to custom and load graph instances from a JSON file. Call when the user wants to provide their own instance file (not the default).",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -269,7 +271,7 @@ ORCHESTRATOR_TOOLS = [
     },
     {
         "name": "load_suite",
-        "description": "Browse and load instances from a benchmark suite (DIMACS, Biq Mac, SNAP). Use when user wants standard benchmark instances.",
+        "description": "Set instance source to suite and load instances from a benchmark suite (DIMACS, Biq Mac, SNAP). First call with suite_key and empty instance_names to list instances; then WAIT for the user to say which instances they want (by name). Only call again with instance_names when the user has specified which to load — do NOT pass all instance names unless the user explicitly asked for all.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -279,12 +281,12 @@ ORCHESTRATOR_TOOLS = [
                 },
                 "suite_key": {
                     "type": "string",
-                    "description": "Key of the suite to browse (returned by list_suites).",
+                    "description": "Key of the suite to browse (e.g. biqmac).",
                 },
                 "instance_names": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Specific instance names to fetch from the suite. If empty, lists available instances.",
+                    "description": "Instance names to load. Leave empty or omit to only list instances. Only fill with names AFTER the user has told you which ones they want (e.g. g05_60.0, g05_80.0). Never pass the full list unless the user said 'all' or 'load all'.",
                 },
             },
         },
@@ -305,24 +307,25 @@ You manage the benchmarking pipeline conversationally. The user talks to you in 
 natural language and you use your tools to take actions. You should be helpful, \
 concise, and proactive.
 
-## Pipeline Steps (flexible order)
+## Pipeline Steps (order matters after intake)
 1. **Intake**: Analyze the problem description (+ optional PDFs) → BenchmarkConfig + AlgorithmSpecs
-2. **Instance source**: Ask the user how they want to provide instances:
-   - **generator** — use the AI-proposed generators (can modify params/sizes)
-   - **custom** — load instances from a JSON file
-   - **suite** — pull from benchmark suites (DIMACS, Biq Mac, SNAP)
-3. **Configure**: Modify generators/instances, execution settings (runs, timeout)
-4. **Algorithms**: Code extracted algorithms from papers
+2. **Which algorithms to implement** (do this BEFORE instance source when paper algorithms exist): If "Paper algorithms (extracted, not yet coded)" is listed, you MUST first ask the user which one(s) to implement by index (e.g. "Which should I code: 0, 1, 2, or all?"). Use code_algorithm with spec_indices only after the user answers. Do NOT skip to instance source without asking about algorithms first.
+3. **Instance source** (REQUIRED before benchmark): The user MUST choose one:
+   - **generator** — use_generators (only after user says they want generators)
+   - **custom** — load_custom_instances when user provides a path
+   - **suite** — load_suite when user wants a suite (Biq Mac, DIMACS, SNAP)
+4. **Configure**: Modify generators/instances, execution settings
 5. **Benchmark**: Run the benchmark
 6. **Analysis**: Visualize and analyze results
 
 ## Key Behaviors
-- After intake, ALWAYS ask the user how they want to provide instances (generator/custom/suite) \
-unless they already specified
+- After intake: if there are paper algorithms (extracted, not yet coded), your FIRST question MUST be: "Which algorithm(s) from the list do you want me to implement? (Reply by index, e.g. 0, 1, or 0 2, or 'all'.)" Do NOT ask about instances until the user has answered this (or said they only want their custom algo).
+- When "Instance source: NOT CHOSEN" appears in state, ask the user to choose: generator, custom JSON file, or benchmark suite. Do NOT call use_generators until the user explicitly chooses generators.
+- When using load_suite: after you list instances (first call with empty instance_names), you MUST wait for the user to tell you which instance names to load. Do NOT call load_suite again with all names — only pass the instance_names the user asked for. If the user says "all" or "load all", then you may pass the full list.
+- Do NOT call analyze_results unless the user explicitly asks for a plot, chart, or analysis (e.g. "plot a bar chart", "show me runtimes"). After run_benchmark, just report that results are ready and ask what they want to do next — do not auto-generate any visualization.
 - The user can go back to any step at any time
 - If the user says "go back", "undo", "restart", or "change X", use the appropriate tool
 - If the user describes a problem, run intake automatically
-- If paper algorithms were extracted, list them and ask which to code
 - Always be concise — don't repeat information the user already knows
 - If unsure what the user wants, ask a brief clarifying question
 - When showing status, be brief — just key facts
@@ -348,9 +351,16 @@ class OrchestratorAgent:
         nemotron_url: str | None = None,
         nemotron_model: str | None = None,
     ):
-        from benchwarmer.agents.backends import ClaudeBackend
+        from benchwarmer.agents.backends import ClaudeBackend, OpenAIBackend
 
-        self.backend = ClaudeBackend()
+        # Same LLM backend for both orchestrator and intake (claude or nemotron)
+        if intake_backend == "nemotron":
+            self.backend = OpenAIBackend(
+                base_url=nemotron_url or "https://integrate.api.nvidia.com/v1",
+                model=nemotron_model or "nvidia/nemotron-3-nano-30b-a3b",
+            )
+        else:
+            self.backend = ClaudeBackend()
         self.state = PipelineState(
             execution_mode=execution_mode,
             pdf_paths=pdf_paths or [],
@@ -527,17 +537,8 @@ class OrchestratorAgent:
 
         from benchwarmer.agents.intake import IntakeAgent
 
-        # Build backend
-        if self.intake_backend_name == "nemotron":
-            from benchwarmer.agents.backends import OpenAIBackend
-            backend = OpenAIBackend(
-                base_url=self.nemotron_url or "https://integrate.api.nvidia.com/v1",
-                model=self.nemotron_model or "nvidia/nemotron-3-nano-30b-a3b",
-            )
-        else:
-            backend = None  # IntakeAgent will use Claude default
-
-        agent = IntakeAgent(backend=backend)
+        # Use same backend as orchestrator (claude or nemotron)
+        agent = IntakeAgent(backend=self.backend)
 
         # Validate PDFs
         pdf_paths = None
@@ -691,6 +692,8 @@ class OrchestratorAgent:
     def _tool_run_benchmark(self, data: dict) -> str:
         if not self.state.config:
             return "❌ No config — run intake first."
+        if not self.state.instance_source:
+            return "❌ Instance source not chosen. Ask the user: use generators (use_generators), custom JSON file (load_custom_instances), or benchmark suite (load_suite)."
         if not self.state.algorithms:
             return "❌ No algorithms registered. Code or add baselines first."
 
@@ -760,7 +763,7 @@ class OrchestratorAgent:
         msg = f"✅ Benchmark complete! {len(df)} rows. ({stats_str})."
         if error_sample:
             msg += f"\n❌ {error_sample}"
-        return msg + "\nAsk to analyze/plot these results."
+        return msg + "\nDo not call analyze_results unless the user explicitly asks for a plot, chart, or analysis."
 
     def _tool_analyze_results(self, data: dict) -> str:
         if self.state.results is None:
@@ -921,13 +924,14 @@ class OrchestratorAgent:
 
         instance_names = data.get("instance_names", [])
 
-        # List instances in suite
+        # List instances in suite — wait for user to choose which to load
         if not instance_names:
             instances = list_instances(suite_key)
             lines = [f"📋 Instances in '{suite_key}':"]
             for inst in instances:
                 lines.append(f"   • {inst['name']} ({inst.get('nodes', '?')} nodes)")
-            lines.append("\nTell me which instances to load (by name).")
+            lines.append("")
+            lines.append("Which instances would you like to load? (Reply with names, e.g. g05_60.0, g05_80.0 — or 'all' for all.)")
             return "\n".join(lines)
 
         # Fetch specific instances

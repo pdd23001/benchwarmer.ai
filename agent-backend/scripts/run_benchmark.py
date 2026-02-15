@@ -1134,9 +1134,9 @@ def main() -> None:
     parser.add_argument("--custom", "-c", type=str, help="Path to custom algorithm file to benchmark against.")
     parser.add_argument("--papers", "-p", nargs="+", type=str, help="PDF papers to analyze for algorithm extraction.")
     parser.add_argument("--mode", "-m", type=str, default="local", choices=["local", "modal"], help="Execution mode.")
-    parser.add_argument("--intake-backend", type=str, default="claude", choices=["claude", "nemotron"], help="LLM backend for Intake Agent.")
-    parser.add_argument("--nemotron-url", type=str, default="https://integrate.api.nvidia.com/v1", help="Base URL for Nemotron.")
-    parser.add_argument("--nemotron-model", type=str, default="nvidia/nemotron-3-nano-30b-a3b", help="Model name for Nemotron.")
+    parser.add_argument("--intake-backend", type=str, default="claude", choices=["claude", "nemotron"], help="LLM backend for both Orchestrator and Intake (claude or nemotron).")
+    parser.add_argument("--nemotron-url", type=str, default="https://integrate.api.nvidia.com/v1", help="Base URL for Nemotron (when --intake-backend=nemotron).")
+    parser.add_argument("--nemotron-model", type=str, default="nvidia/nemotron-3-nano-30b-a3b", help="Model name for Nemotron (when --intake-backend=nemotron).")
     parser.add_argument("--no-orchestrator", action="store_true", help="Use legacy step-by-step flow instead of conversational mode.")
     args = parser.parse_args()
 
