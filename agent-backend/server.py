@@ -25,6 +25,7 @@ from benchwarmer.config import BenchmarkConfig, GeneratorConfig, InstanceConfig
 from benchwarmer.engine.runner import BenchmarkRunner
 from benchwarmer.agents.intake import IntakeAgent
 from benchwarmer.agents.implementation import ImplementationAgent
+from benchwarmer.engine.modal_runner import ModalRunner
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -153,6 +154,11 @@ class ChallengerResponse(BaseModel):
 class ConfigureResponse(BaseModel):
     config: Dict[str, Any]
     message: str
+
+class RunSessionRequest(BaseModel):
+    execution_mode: str = "local"  # "local" or "modal"
+    modal_token_id: Optional[str] = None
+    modal_token_secret: Optional[str] = None
 
 class BenchmarkRequest(BaseModel):
     query: str
@@ -484,7 +490,7 @@ async def configure_session(session_id: str, preferences: str = Form(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/session/{session_id}/run", response_model=BenchmarkResponse)
-async def run_session(session_id: str):
+async def run_session(session_id: str, request: RunSessionRequest = RunSessionRequest()):
     """Step 4: Execute Benchmark (Live)"""
     session = session_manager.get_session(session_id)
     if not session["config"]:
@@ -503,7 +509,7 @@ async def run_session(session_id: str):
     # We are changing the frontend anyway. 
     # Let's change this endpoint to return { "status": "started" } and stream results via WS.
     
-    asyncio.create_task(execute_session_benchmark(session_id))
+    asyncio.create_task(execute_session_benchmark(session_id, request))
     
     # Return empty/partial response or change the model. 
     # For now, let's keep the model but return empty data, frontend will ignore it 
@@ -516,7 +522,7 @@ async def run_session(session_id: str):
         data=[]
     )
 
-async def execute_session_benchmark(session_id: str):
+async def execute_session_benchmark(session_id: str, request: RunSessionRequest):
     """Orchestrates the parallel execution of all agents/algorithms"""
     session = session_manager.get_session(session_id)
     config = session["config"]
@@ -525,7 +531,14 @@ async def execute_session_benchmark(session_id: str):
     # For each PDF challenger, we need to generate code
     
     # 2. Register Algorithms
-    runner = BenchmarkRunner(config)
+    if request.execution_mode == "modal":
+        runner = ModalRunner(
+            config,
+            modal_token_id=request.modal_token_id,
+            modal_token_secret=request.modal_token_secret
+        )
+    else:
+        runner = BenchmarkRunner(config)
     
     # Attach WebSocket Logger to the runner
     runner_logger = logging.getLogger("benchwarmer.engine.runner")
@@ -606,6 +619,7 @@ async def execute_session_benchmark(session_id: str):
                     await ws_manager.broadcast(session_id, {
                         "type": "log",
                         "source": "ImplementationAgent",
+                        "challenger_id": c["id"],
                         "message": f"Generated code for {c['name']}:\n{result.get('code', '')[:200]}..."
                     })
                 else:
@@ -632,9 +646,14 @@ async def execute_session_benchmark(session_id: str):
     # For v0, let's just run it synchronously and emit the final result
     # We will refine 'live' streaming in the next iteration.
     
-    loop = asyncio.get_event_loop()
     try:
-        df = await loop.run_in_executor(None, runner.run)
+        if request.execution_mode == "modal":
+            # ModalRunner is Async
+            df = await runner.run()
+        else:
+            # BenchmarkRunner is Sync
+            loop = asyncio.get_event_loop()
+            df = await loop.run_in_executor(None, runner.run)
     finally:
         # Cleanup logger
         runner_logger.removeHandler(ws_handler)
