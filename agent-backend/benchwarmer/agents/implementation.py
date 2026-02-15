@@ -1,6 +1,6 @@
 """
 Implementation Agent — generates AlgorithmWrapper subclasses from
-natural language descriptions using Claude Sonnet 4.
+natural language descriptions using Claude Opus 4.6.
 
 The agent receives the problem class context (solution format, validation
 rules) and the AlgorithmWrapper API, then generates working Python code
@@ -169,7 +169,7 @@ class ImplementationAgent:
     def __init__(
         self,
         api_key: str | None = None,
-        model: str = "claude-sonnet-4-20250514",
+        model: str = "claude-opus-4-6",
     ) -> None:
         try:
             import anthropic
