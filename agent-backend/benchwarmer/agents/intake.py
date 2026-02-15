@@ -221,6 +221,11 @@ class IntakeAgent:
         logger.info("IntakeAgent run() called with: %r (PDFs: %s)",
                     user_description, pdf_paths)
 
+        # Nemotron uses <think> blocks that consume a large portion of the
+        # token budget, so we give it more room.  Claude is fast enough at 4096.
+        from benchwarmer.agents.backends import ClaudeBackend as _CB
+        _max_tokens = 4096 if isinstance(self.backend, _CB) else 8192
+
         max_turns = 10  # safety rail
         for turn in range(max_turns):
             logger.info("Intake agent turn %d", turn + 1)
@@ -229,7 +234,7 @@ class IntakeAgent:
                 messages=messages,
                 system=system_prompt,
                 tools=tools,
-                max_tokens=4096,
+                max_tokens=_max_tokens,
             )
 
             logger.debug("Stop reason: %s", response.stop_reason)
@@ -259,15 +264,40 @@ class IntakeAgent:
                 messages.append({"role": "user", "content": tool_results})
                 continue
 
-            # ── Handle end_turn (text response) ──────────────────
-            if response.stop_reason in ("end_turn", "stop"):
+            # ── Handle end_turn / max_tokens (text response) ────────
+            if response.stop_reason in ("end_turn", "stop", "max_tokens"):
                 text = self._extract_text(response.content)
+
+                if response.stop_reason == "max_tokens":
+                    logger.warning(
+                        "Intake response hit max_tokens — attempting to "
+                        "parse partial output (%d chars)", len(text)
+                    )
 
                 # Try to extract an IntakeResult from the response
                 result = self._try_parse_result(text)
                 if result is not None:
                     print(f"\n[Intake Agent]:\n{text}")
                     return result
+
+                # If max_tokens and no result, retry with a nudge to be concise
+                if response.stop_reason == "max_tokens":
+                    logger.info(
+                        "Could not parse partial output — retrying with "
+                        "conciseness nudge"
+                    )
+                    from dataclasses import asdict
+                    serializable_content = [asdict(block) for block in response.content]
+                    messages.append({"role": "assistant", "content": serializable_content})
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "Your response was cut off. Please output ONLY the "
+                            "final IntakeResult JSON inside a ```json code block. "
+                            "No explanation, no reasoning, just the JSON."
+                        ),
+                    })
+                    continue
 
                 # No result yet — agent is asking a clarifying question
                 print(f"\n[Intake Agent]:\n{text}")

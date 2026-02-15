@@ -563,6 +563,11 @@ class OrchestratorAgent:
         )
         reply_text = ""
 
+        # Nemotron's <think> blocks consume a lot of the token budget,
+        # so give non-Claude backends more room.
+        from benchwarmer.agents.backends import ClaudeBackend as _CB
+        _max_tokens = 4096 if isinstance(self.backend, _CB) else 8192
+
         for _ in range(max_tool_turns):
             if progress_cb:
                 progress_cb({"type": "thinking"})
@@ -572,7 +577,7 @@ class OrchestratorAgent:
                     messages=messages,
                     system=system,
                     tools=ORCHESTRATOR_TOOLS,
-                    max_tokens=4096,
+                    max_tokens=_max_tokens,
                 )
             except Exception as e:
                 logger.exception("LLM generate error: %s", e)
@@ -605,8 +610,10 @@ class OrchestratorAgent:
                 )
                 continue
 
-            # Final text reply
-            if response.stop_reason in ("end_turn", "stop"):
+            # Final text reply (also accept max_tokens — use whatever was generated)
+            if response.stop_reason in ("end_turn", "stop", "max_tokens"):
+                if response.stop_reason == "max_tokens":
+                    logger.warning("Orchestrator response hit max_tokens — using partial output")
                 for block in response.content:
                     if hasattr(block, "text"):
                         reply_text += block.text
@@ -635,6 +642,10 @@ class OrchestratorAgent:
         print("Type 'exit' or 'quit' to stop.\n")
 
         messages: list[dict[str, Any]] = []
+
+        # Nemotron's <think> blocks consume a lot of the token budget
+        from benchwarmer.agents.backends import ClaudeBackend as _CB
+        _max_tokens = 4096 if isinstance(self.backend, _CB) else 8192
 
         # If PDF paths were provided via CLI, mention them in the initial context
         if self.state.pdf_paths:
@@ -682,7 +693,7 @@ class OrchestratorAgent:
                         messages=messages,
                         system=system,
                         tools=ORCHESTRATOR_TOOLS,
-                        max_tokens=4096,
+                        max_tokens=_max_tokens,
                     )
                 except Exception as e:
                     print(f"\n❌ LLM error: {e}\n")
@@ -711,8 +722,10 @@ class OrchestratorAgent:
                     messages.append({"role": "user", "content": tool_results})
                     continue
 
-                # Handle text response
-                if response.stop_reason in ("end_turn", "stop"):
+                # Handle text response (also accept max_tokens)
+                if response.stop_reason in ("end_turn", "stop", "max_tokens"):
+                    if response.stop_reason == "max_tokens":
+                        logger.warning("CLI orchestrator response hit max_tokens — using partial output")
                     text = ""
                     for block in response.content:
                         if hasattr(block, "text"):
