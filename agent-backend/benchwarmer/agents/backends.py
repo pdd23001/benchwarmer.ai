@@ -8,11 +8,113 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 logger = logging.getLogger(__name__)
+
+
+# ──────────────────────────────────────────────────────────────
+# Fallback parser for local models (Ollama/Nemotron) that emit
+# tool calls as text markup instead of structured API responses.
+# ──────────────────────────────────────────────────────────────
+
+def _strip_think_blocks(text: str) -> str:
+    """Remove <think>...</think> reasoning blocks from model output."""
+    # Remove complete think blocks
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    # Remove unclosed think blocks (model started thinking but didn't close)
+    text = re.sub(r"<think>.*", "", text, flags=re.DOTALL)
+    # Remove orphaned </think> tags
+    text = re.sub(r"</think>\s*", "", text)
+    return text.strip()
+
+
+def _parse_tool_calls_from_text(text: str) -> list[dict[str, Any]]:
+    """
+    Parse tool calls embedded as text markup in model output.
+
+    Supports formats commonly emitted by Ollama/Nemotron:
+
+    Format 1 (XML-style):
+        <tool_call>
+        <function=run_intake>
+        <parameter=description>Max cut</parameter>
+        </function>
+        </tool_call>
+
+    Format 2 (JSON-style):
+        <tool_call>
+        {"name": "run_intake", "arguments": {"description": "Max cut"}}
+        </tool_call>
+
+    Returns list of dicts with keys: name, arguments (dict).
+    """
+    tool_calls = []
+
+    # Find all <tool_call>...</tool_call> blocks
+    tc_blocks = re.findall(
+        r"<tool_call>(.*?)</tool_call>", text, flags=re.DOTALL
+    )
+
+    for block in tc_blocks:
+        block = block.strip()
+
+        # ── Format 1: <function=name> ... <parameter=key>value</parameter> ──
+        func_match = re.search(r"<function=(\w+)>", block)
+        if func_match:
+            func_name = func_match.group(1)
+            params = {}
+            for pm in re.finditer(
+                r"<parameter=(\w+)>(.*?)</parameter>", block, flags=re.DOTALL
+            ):
+                key = pm.group(1)
+                value = pm.group(2).strip()
+                # Try to parse as JSON value (number, bool, list, dict)
+                try:
+                    params[key] = json.loads(value)
+                except (json.JSONDecodeError, ValueError):
+                    params[key] = value
+            tool_calls.append({"name": func_name, "arguments": params})
+            continue
+
+        # ── Format 2: JSON object with name + arguments ──
+        try:
+            data = json.loads(block)
+            if isinstance(data, dict) and "name" in data:
+                args = data.get("arguments", data.get("parameters", {}))
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except json.JSONDecodeError:
+                        args = {}
+                tool_calls.append({"name": data["name"], "arguments": args})
+                continue
+        except json.JSONDecodeError:
+            pass
+
+        # ── Format 3: {"function": {"name": ..., "arguments": ...}} ──
+        try:
+            data = json.loads(block)
+            if isinstance(data, dict) and "function" in data:
+                func = data["function"]
+                args = func.get("arguments", {})
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except json.JSONDecodeError:
+                        args = {}
+                tool_calls.append({"name": func["name"], "arguments": args})
+                continue
+        except json.JSONDecodeError:
+            pass
+
+        logger.warning("Could not parse tool_call block: %s", block[:200])
+
+    return tool_calls
 
 
 @dataclass
@@ -170,18 +272,16 @@ class OpenAIBackend(AbstractLLMBackend):
         message = choice.message
         
         content_blocks = []
+        has_structured_tool_calls = False
         
-        # Text content
-        if message.content:
-            content_blocks.append(TextBlock(text=message.content))
-        
-        # Tool calls
+        # Tool calls (structured API response — preferred path)
         if message.tool_calls:
+            has_structured_tool_calls = True
             for tc in message.tool_calls:
                 try:
                     args = json.loads(tc.function.arguments)
                 except json.JSONDecodeError:
-                    args = {}  # or raw string?
+                    args = {}
                 
                 content_blocks.append(
                     ToolUseBlock(
@@ -191,9 +291,51 @@ class OpenAIBackend(AbstractLLMBackend):
                     )
                 )
 
+        # Text content — may contain embedded tool calls from local models
+        raw_text = message.content or ""
+        
+        if raw_text and not has_structured_tool_calls:
+            # ── Fallback: parse tool calls from text markup ──
+            # Local models (Ollama/Nemotron) often emit <tool_call> XML
+            # and <think> blocks as plain text instead of using the API.
+            parsed_calls = _parse_tool_calls_from_text(raw_text)
+            
+            if parsed_calls:
+                logger.info(
+                    "Parsed %d tool call(s) from text markup (fallback)",
+                    len(parsed_calls),
+                )
+                for tc in parsed_calls:
+                    content_blocks.append(
+                        ToolUseBlock(
+                            id=f"call_{uuid.uuid4().hex[:12]}",
+                            name=tc["name"],
+                            input=tc["arguments"],
+                        )
+                    )
+                has_structured_tool_calls = True
+                
+                # Extract any non-tool-call text (strip think blocks + tool_call blocks)
+                remaining = _strip_think_blocks(raw_text)
+                remaining = re.sub(
+                    r"<tool_call>.*?</tool_call>", "", remaining, flags=re.DOTALL
+                ).strip()
+                if remaining:
+                    content_blocks.insert(0, TextBlock(text=remaining))
+            else:
+                # No tool calls found — just clean up think blocks from text
+                cleaned = _strip_think_blocks(raw_text)
+                if cleaned:
+                    content_blocks.append(TextBlock(text=cleaned))
+        elif raw_text and has_structured_tool_calls:
+            # Structured tool calls exist but there's also text — clean it
+            cleaned = _strip_think_blocks(raw_text)
+            if cleaned:
+                content_blocks.insert(0, TextBlock(text=cleaned))
+
         # Stop reason mapping
         stop_reason = "end_turn"
-        if choice.finish_reason == "tool_calls":
+        if has_structured_tool_calls or choice.finish_reason == "tool_calls":
             stop_reason = "tool_use"
         elif choice.finish_reason == "length":
             stop_reason = "max_tokens"

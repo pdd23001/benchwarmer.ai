@@ -347,7 +347,7 @@ async def chat_turn(request: ChatRequest):
 
         # Resolve LLM backend — "claude" or "nemotron"
         backend_choice = (request.llm_backend or "claude").lower()
-        nemotron_url = os.environ.get("NEMOTRON_URL", "http://10.19.177.52:11434/v1")
+        nemotron_url = os.environ.get("NEMOTRON_URL", "http://10.19.179.173:11434/v1")
         nemotron_model = os.environ.get(
             "NEMOTRON_MODEL",
             "hf.co/unsloth/Nemotron-3-Nano-30B-A3B-GGUF:Q4_K_M",
