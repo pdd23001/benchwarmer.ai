@@ -16,6 +16,7 @@ import json
 import logging
 import os
 from typing import Any, Optional
+import anthropic
 
 from benchwarmer.agents.tools import (
     TOOL_DEFINITIONS,
@@ -191,13 +192,39 @@ class IntakeAgent:
         for turn in range(max_turns):
             logger.info("Intake agent turn %d", turn + 1)
 
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=4096,
-                system=SYSTEM_PROMPT,
-                tools=TOOL_DEFINITIONS,
-                messages=messages,
-            )
+            try:
+                response = self.client.messages.create(
+                    model=self.model,
+                    max_tokens=4096,
+                    system=SYSTEM_PROMPT,
+                    tools=TOOL_DEFINITIONS,
+                    messages=messages,
+                )
+            except Exception as e:
+                logger.error(f"Intake agent failed: {e}")
+                # Fallback to sensible default
+                print("\n⚠️  Agent API failed (likely low credits). Using default config.")
+                return BenchmarkConfig(
+                    problem_class="maximum_cut",
+                    problem_description="Fallback config due to API error",
+                    objective="maximize",
+                    instance_config={
+                        "generators": [
+                            {
+                                "type": "erdos_renyi",
+                                "params": {"p": 0.5},
+                                "sizes": [20, 30, 50],
+                                "count_per_size": 3,
+                                "why": "Fallback default"
+                            }
+                        ]
+                    },
+                    execution_config={
+                        "timeout_seconds": 30,
+                        "runs_per_config": 1,
+                        "memory_limit_mb": 1024
+                    }
+                )
 
             logger.debug("Stop reason: %s", response.stop_reason)
 
