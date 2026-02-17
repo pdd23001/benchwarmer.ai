@@ -1,7 +1,7 @@
 import { Link, useLocation } from "react-router-dom"
 import { cn } from "@/lib/utils"
 import { Bot, BarChart2 } from "lucide-react"
-import { Button } from "@/components/ui/button"
+
 
 export function Header() {
     const location = useLocation()
