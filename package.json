@@ -1,0 +1,7 @@
+{
+  "name": "benchwarmer-ai",
+  "private": true,
+  "scripts": {
+    "build": "cd frontend-vite && npm run build"
+  }
+}

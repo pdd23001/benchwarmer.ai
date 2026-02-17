@@ -22,6 +22,7 @@ benchwarmer.ai automates the painful workflow of algorithm benchmarking. Upload 
 - [Prerequisites](#prerequisites)
 - [Setup](#setup)
 - [Running the App](#running-the-app)
+- [Deploying to Vercel](#deploying-to-vercel)
 - [Environment Variables](#environment-variables)
 - [License](#license)
 
@@ -341,6 +342,25 @@ To use NVIDIA Nemotron as the LLM backend (instead of Claude) for the intake and
 3. Select **Nemotron** as the LLM backend in the chat UI.
 
 This runs inference entirely on local DGX hardware — no cloud API costs, low latency, and full data privacy.
+
+---
+
+## Deploying to Vercel
+
+The frontend (Vite + React) can be deployed to [Vercel](https://vercel.com) in either of these ways:
+
+**Option A — Deploy from repo root (recommended)**  
+Connect your repo to Vercel. The root `vercel.json` and `package.json` are set up so that:
+- Dependencies are installed from `frontend-vite/`
+- The build runs in `frontend-vite/`
+- The output is served from `frontend-vite/dist` with SPA routing.
+
+No extra Vercel settings are required; just import the repo and deploy.
+
+**Option B — Deploy only the frontend**  
+In the Vercel project, set **Root Directory** to `frontend-vite`. Then install, build, and output will use that folder. The frontend’s `vercel.json` handles SPA rewrites.
+
+Node 20 is recommended (see `frontend-vite/.nvmrc`). The backend (`agent-backend/`) is not deployed to Vercel; run it separately and point the frontend’s API base URL to your backend if needed.
 
 ---
 
