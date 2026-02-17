@@ -59,6 +59,9 @@ export function useChat() {
     const abortControllerRef = useRef<AbortController | null>(null)
     const pollingRef = useRef(false)
 
+    // API Base URL from environment or empty string (for relative paths/proxy)
+    const API_BASE = import.meta.env.VITE_API_BASE_URL || ""
+
     // ── Poll for completion when backend is still processing ──────────────
     const pollForCompletion = useCallback(
         (sid: string) => {
@@ -70,7 +73,7 @@ export function useChat() {
                 if (!pollingRef.current) return
                 try {
                     // Check processing status
-                    const statusRes = await fetch(`/api/chat/${sid}/status`)
+                    const statusRes = await fetch(`${API_BASE}/api/chat/${sid}/status`)
                     if (!statusRes.ok) {
                         pollingRef.current = false
                         setIsLoading(false)
@@ -79,7 +82,7 @@ export function useChat() {
                     const { processing } = await statusRes.json()
 
                     // Fetch latest messages from DB
-                    const histRes = await fetch(`/api/chat/${sid}`)
+                    const histRes = await fetch(`${API_BASE}/api/chat/${sid}`)
                     if (histRes.ok) {
                         const data = await histRes.json()
                         if (Array.isArray(data) && data.length > 0) {
@@ -115,7 +118,7 @@ export function useChat() {
         if (savedSessionId) {
             // Check if the backend is still processing this session.
             // If yes → restore history + poll.  If no → start fresh.
-            fetch(`/api/chat/${savedSessionId}/status`)
+            fetch(`${API_BASE}/api/chat/${savedSessionId}/status`)
                 .then((res) => res.ok ? res.json() : { processing: false })
                 .then(({ processing }) => {
                     if (processing) {
@@ -148,7 +151,7 @@ export function useChat() {
     // ── Fetch history + check if backend is still processing ─────────────
     const fetchHistory = async (sid: string) => {
         try {
-            const res = await fetch(`/api/chat/${sid}`)
+            const res = await fetch(`${API_BASE}/api/chat/${sid}`)
             if (!res.ok) {
                 if (res.status === 404) {
                     setSessionId(null)
@@ -161,7 +164,7 @@ export function useChat() {
             }
 
             // Check if backend is still processing this session
-            const statusRes = await fetch(`/api/chat/${sid}/status`)
+            const statusRes = await fetch(`${API_BASE}/api/chat/${sid}/status`)
             if (statusRes.ok) {
                 const { processing } = await statusRes.json()
                 if (processing) {
@@ -263,7 +266,7 @@ export function useChat() {
 
             abortControllerRef.current = new AbortController()
 
-            const response = await fetch("/api/chat", {
+            const response = await fetch(`${API_BASE}/api/chat`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(formData),
@@ -331,7 +334,7 @@ export function useChat() {
                                             lastMsg.tools.findLastIndex(
                                                 (t: ToolCall) =>
                                                     t.tool ===
-                                                        event.tool &&
+                                                    event.tool &&
                                                     t.status === "running"
                                             )
                                         if (toolIdx !== -1) {
