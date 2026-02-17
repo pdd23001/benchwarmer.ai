@@ -26,9 +26,15 @@ def init_db():
             content TEXT NOT NULL,
             tools TEXT,
             plot_image TEXT,
+            metadata TEXT,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    # Add metadata column to existing databases
+    try:
+        conn.execute('ALTER TABLE messages ADD COLUMN metadata TEXT')
+    except sqlite3.OperationalError:
+        pass  # column already exists
     conn.execute('''
         CREATE TABLE IF NOT EXISTS algorithms (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -40,12 +46,13 @@ def init_db():
     conn.commit()
     conn.close()
 
-def save_message(session_id: str, role: str, content: str, tools: Optional[List[Dict]] = None, plot_image: Optional[str] = None):
+def save_message(session_id: str, role: str, content: str, tools: Optional[List[Dict]] = None, plot_image: Optional[str] = None, metadata: Optional[Dict] = None):
     conn = get_db_connection()
     tools_json = json.dumps(tools) if tools else None
+    metadata_json = json.dumps(metadata) if metadata else None
     conn.execute(
-        'INSERT INTO messages (session_id, role, content, tools, plot_image) VALUES (?, ?, ?, ?, ?)',
-        (session_id, role, content, tools_json, plot_image)
+        'INSERT INTO messages (session_id, role, content, tools, plot_image, metadata) VALUES (?, ?, ?, ?, ?, ?)',
+        (session_id, role, content, tools_json, plot_image, metadata_json)
     )
     conn.commit()
     conn.close()
@@ -61,12 +68,20 @@ def get_messages(session_id: str) -> List[Dict[str, Any]]:
     messages = []
     for row in rows:
         msg = {
-            "id": str(row["id"]), # Convert integer ID to string for frontend consistency
+            "id": str(row["id"]),
             "role": row["role"],
             "content": row["content"],
             "tools": json.loads(row["tools"]) if row["tools"] else [],
-            "plotImage": row["plot_image"]
+            "plotImage": row["plot_image"],
         }
+        # Restore rich UI metadata (algorithmChoices, choicePrompt, etc.)
+        meta_str = row["metadata"] if "metadata" in row.keys() else None
+        if meta_str:
+            meta = json.loads(meta_str)
+            if meta.get("algorithmChoices"):
+                msg["algorithmChoices"] = meta["algorithmChoices"]
+            if meta.get("choicePrompt"):
+                msg["choicePrompt"] = meta["choicePrompt"]
         messages.append(msg)
     return messages
 

@@ -401,6 +401,8 @@ async def chat_turn(request: ChatRequest):
     loop = asyncio.get_running_loop()
     q: asyncio.Queue = asyncio.Queue()
     _tools_called: list[str] = []
+    _tool_records: list[dict] = []  # full tool call records for DB persistence
+    _ui_metadata: dict = {}  # algorithmChoices, choicePrompt, etc.
 
     _last_tool_input: dict = {}
 
@@ -410,10 +412,27 @@ async def chat_turn(request: ChatRequest):
             _tools_called.append(event.get("tool", ""))
             _last_tool_input.clear()
             _last_tool_input.update(event.get("input", {}))
+            _tool_records.append({"tool": event.get("tool", ""), "status": "running"})
+        elif event.get("type") == "tool_end":
+            # Mark the matching tool record as completed
+            for t in reversed(_tool_records):
+                if t["tool"] == event.get("tool") and t["status"] == "running":
+                    t["status"] = "completed"
+                    t["result"] = event.get("result")
+                    break
         try:
             loop.call_soon_threadsafe(q.put_nowait, event)
         except RuntimeError:
             pass  # loop closed — SSE client gone, that's fine
+
+        # Capture choice_prompt events for DB persistence
+        if event.get("type") == "choice_prompt":
+            _ui_metadata["choicePrompt"] = {
+                "id": event.get("id"),
+                "title": event.get("title"),
+                "options": event.get("options"),
+                "multiSelect": event.get("multi_select", False),
+            }
 
         # After intake completes, emit structured algorithm choices for the UI
         if (
@@ -432,6 +451,7 @@ async def chat_turn(request: ChatRequest):
                 }
                 for i, s in enumerate(agent.state.algo_specs)
             ]
+            _ui_metadata["algorithmChoices"] = algos
             try:
                 loop.call_soon_threadsafe(q.put_nowait, {
                     "type": "algorithm_select",
@@ -480,6 +500,12 @@ async def chat_turn(request: ChatRequest):
                         "description": f"{m.group(3)} instances — {m.group(4).strip()}",
                     })
                 if suite_opts:
+                    _ui_metadata["choicePrompt"] = {
+                        "id": "benchmark_suite",
+                        "title": "Select a benchmark suite",
+                        "options": suite_opts,
+                        "multiSelect": False,
+                    }
                     try:
                         loop.call_soon_threadsafe(q.put_nowait, {
                             "type": "choice_prompt",
@@ -504,6 +530,12 @@ async def chat_turn(request: ChatRequest):
                         "description": f"{m.group(2)} nodes",
                     })
                 if inst_opts:
+                    _ui_metadata["choicePrompt"] = {
+                        "id": "benchmark_instances",
+                        "title": "Select instances to load",
+                        "options": inst_opts,
+                        "multiSelect": True,
+                    }
                     try:
                         loop.call_soon_threadsafe(q.put_nowait, {
                             "type": "choice_prompt",
@@ -546,12 +578,6 @@ async def chat_turn(request: ChatRequest):
                     plot_image = f"data:image/png;base64,{encoded}"
                 _agent.state.last_plot_path = None
 
-            # Always persist to DB (even if the SSE client disconnected)
-            save_message(
-                session_id=_sid, role="assistant",
-                content=reply, tools=None, plot_image=plot_image,
-            )
-
             # Emit interactive choice prompts based on pipeline state
             # Only show instance source if code_algorithm was called this turn
             # AND user didn't already specify an instance source preference
@@ -570,32 +596,46 @@ async def chat_turn(request: ChatRequest):
                 if gens:
                     gen_names = [g.type for g in gens]
                     gen_desc = f" ({', '.join(gen_names)})"
+                instance_source_prompt = {
+                    "id": "instance_source",
+                    "title": "How would you like to provide instances?",
+                    "options": [
+                        {
+                            "value": "generators",
+                            "label": "Generators",
+                            "description": f"Use proposed graph generators{gen_desc}",
+                        },
+                        {
+                            "value": "custom",
+                            "label": "Custom JSON",
+                            "description": "Load from your own instance file",
+                        },
+                        {
+                            "value": "benchmark suite",
+                            "label": "Benchmark Suite",
+                            "description": "Use standard benchmark instances (DIMACS, BiqMac, etc.)",
+                        },
+                    ],
+                    "multiSelect": False,
+                }
+                _ui_metadata["choicePrompt"] = instance_source_prompt
                 try:
                     loop.call_soon_threadsafe(q.put_nowait, {
                         "type": "choice_prompt",
-                        "id": "instance_source",
-                        "title": "How would you like to provide instances?",
-                        "options": [
-                            {
-                                "value": "generators",
-                                "label": "Generators",
-                                "description": f"Use proposed graph generators{gen_desc}",
-                            },
-                            {
-                                "value": "custom",
-                                "label": "Custom JSON",
-                                "description": "Load from your own instance file",
-                            },
-                            {
-                                "value": "benchmark suite",
-                                "label": "Benchmark Suite",
-                                "description": "Use standard benchmark instances (DIMACS, BiqMac, etc.)",
-                            },
-                        ],
+                        **instance_source_prompt,
                         "multi_select": False,
                     })
                 except RuntimeError:
                     pass
+
+            # Always persist to DB (even if the SSE client disconnected)
+            save_message(
+                session_id=_sid, role="assistant",
+                content=reply,
+                tools=_tool_records if _tool_records else None,
+                plot_image=plot_image,
+                metadata=_ui_metadata if _ui_metadata else None,
+            )
 
             # Notify queue — the SSE generator will pick this up if connected
             try:
