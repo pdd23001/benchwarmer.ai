@@ -515,6 +515,9 @@ async def chat_turn(request: ChatRequest):
                     except RuntimeError:
                         pass
 
+    # Emit session_start immediately so the frontend can persist the session ID
+    q.put_nowait({"type": "session_start", "session_id": session_id})
+
     # Mark session as actively processing
     _SESSIONS[session_id]["processing"] = True
     _SESSIONS[session_id]["event_queue"] = q

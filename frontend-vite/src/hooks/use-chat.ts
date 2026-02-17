@@ -297,6 +297,12 @@ export function useChat() {
                         try {
                             const event = JSON.parse(jsonStr)
 
+                            // Capture session ID immediately so it persists across refresh
+                            if (event.type === "session_start" && event.session_id) {
+                                setSessionId(event.session_id)
+                                continue
+                            }
+
                             setMessages((prev) => {
                                 const newMsgs = [...prev]
                                 const lastMsg =
