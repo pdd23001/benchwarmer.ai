@@ -111,27 +111,12 @@ export function useChat() {
         []
     )
 
-    // ── On mount: only restore session if backend is still processing ────
-    // Otherwise start fresh so the user sees the welcome/logo screen.
+    // ── On mount: restore session from localStorage if it exists ──────────
     useEffect(() => {
         const savedSessionId = localStorage.getItem("benchwarmer_session_id")
         if (savedSessionId) {
-            // Check if the backend is still processing this session.
-            // If yes → restore history + poll.  If no → start fresh.
-            fetch(`${API_BASE}/api/chat/${savedSessionId}/status`)
-                .then((res) => res.ok ? res.json() : { processing: false })
-                .then(({ processing }) => {
-                    if (processing) {
-                        setSessionId(savedSessionId)
-                        fetchHistory(savedSessionId)
-                    }
-                    // If not processing, don't restore — user gets a clean slate.
-                    // We keep the session_id in localStorage so the backend
-                    // can still look up the session if the user sends a message.
-                })
-                .catch(() => {
-                    // Network error — don't restore
-                })
+            setSessionId(savedSessionId)
+            fetchHistory(savedSessionId)
         }
         return () => {
             pollingRef.current = false
