@@ -184,6 +184,14 @@ def execute_algorithm_code(
             "traceback": traceback.format_exc(),
         }
 
+    # Preserve the original source so ModalRunner can ship dynamic classes
+    # (inspect.getsource() does not work for exec-defined classes).
+    try:
+        setattr(algo_instance, "_source_code", code)
+    except Exception:
+        # Non-fatal; local mode can still run without source attachment.
+        pass
+
     # Step 4: Verify it has a name
     if not hasattr(algo_instance, "name") or algo_instance.name == "unnamed":
         return {

@@ -233,11 +233,16 @@ class OpenAIBackend(AbstractLLMBackend):
                 "Install it with: pip install openai"
             ) from e
 
-        resolved_key = api_key or os.environ.get("NVIDIA_API_KEY")
-        if not resolved_key:
-            raise ValueError(
-                "No NVIDIA API key provided. Pass api_key= or set NVIDIA_API_KEY."
-            )
+        # Support both hosted APIs (key required) and local/edge OpenAI-compatible
+        # servers that may not require auth headers. The OpenAI client expects a
+        # non-empty key, so we pass a harmless placeholder when none is provided.
+        resolved_key = (
+            api_key
+            or os.environ.get("NEMOTRON_API_KEY")
+            or os.environ.get("NVIDIA_API_KEY")
+            or os.environ.get("OPENAI_API_KEY")
+            or "edge-local-noauth"
+        )
 
         self.client = openai.OpenAI(base_url=base_url, api_key=resolved_key)
         self.model = model

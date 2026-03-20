@@ -1,37 +1,34 @@
-"""
-Benchwarmer.AI — FastAPI backend.
 
-Endpoints:
-    POST /api/chat        SSE-streaming multi-turn orchestrator (primary)
-    POST /api/benchmark   Legacy one-shot benchmark
-"""
-
-import asyncio
-import base64
-import json
 import logging
-import os
 import sys
-import tempfile
-import threading
-import uuid
-from typing import Any, Dict, List, Optional
-
 import pandas as pd
-from fastapi import FastAPI, HTTPException
+import tempfile
+import os
+import re
+from pathlib import Path
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from typing import List, Dict, Any, Optional
 
 # Ensure we can import from benchwarmer package
-sys.path.insert(0, ".")
+import asyncio
+import uuid
+import json
+import time
+import subprocess
+from collections import defaultdict
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
+import httpx
 
 from benchwarmer.algorithms.base import AlgorithmWrapper
 from benchwarmer.config import BenchmarkConfig, GeneratorConfig, InstanceConfig
 from benchwarmer.engine.runner import BenchmarkRunner
 from benchwarmer.agents.intake import IntakeAgent
-from benchwarmer.agents.orchestrator import OrchestratorAgent
-from benchwarmer.utils.loader import load_algorithm_from_file
+from benchwarmer.agents.implementation import ImplementationAgent
+from benchwarmer.agents.backends import OpenAIBackend
+from benchwarmer.engine.modal_runner import ModalRunner
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -39,37 +36,417 @@ load_dotenv()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
-logger = logging.getLogger(__name__)
 
 app = FastAPI()
+
+# Edge Nemotron defaults (DGX Spark / Ollama-compatible API).
+NEMOTRON_BASE_URL = os.environ.get("NEMOTRON_BASE_URL", "http://10.19.177.52:11434/api")
+NEMOTRON_MODEL = os.environ.get(
+    "NEMOTRON_MODEL",
+    "hf.co/unsloth/Nemotron-3-Nano-30B-A3B-GGUF:Q4_K_M",
+)
+NEMOTRON_API_KEY = (
+    os.environ.get("NEMOTRON_API_KEY")
+    or os.environ.get("NVIDIA_API_KEY")
+    or os.environ.get("OPENAI_API_KEY")
+)
+
+# Add CORS middleware to allow frontend requests
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:3000"],  # Next.js default port
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+MAX_PY_UPLOAD_BYTES = 512 * 1024        # 512 KB
+MAX_PDF_UPLOAD_BYTES = 20 * 1024 * 1024  # 20 MB
+
+# ─── Session & WebSocket Management ──────────────────────────────────────────
+
+class SessionManager:
+    def __init__(self):
+        # session_id -> { "files": [], "algorithms": [], "config": None, "logs": [] }
+        self.sessions: Dict[str, Dict[str, Any]] = {}
+
+    def create_session(self) -> str:
+        session_id = str(uuid.uuid4())
+        self.sessions[session_id] = {
+            "created_at": time.time(),
+            "user_algo_path": None,
+            "user_algo_name": None,
+            "problem_class": None,
+            "challengers": [],  # List of {id, type, status, path, name}
+            "config": None,
+            "base_dir": tempfile.mkdtemp(prefix=f"benchwarmer_{session_id}_")
+        }
+        return session_id
+
+    def get_session(self, session_id: str) -> Dict[str, Any]:
+        if session_id not in self.sessions:
+            raise HTTPException(status_code=404, detail="Session not found")
+        return self.sessions[session_id]
+
+    def add_challenger(self, session_id: str, type: str, path: str, name: str) -> str:
+        session = self.get_session(session_id)
+        challenger_id = str(uuid.uuid4())
+        session["challengers"].append({
+            "id": challenger_id,
+            "type": type,        # "pdf", "text", "baseline"
+            "status": "pending", # "analyzing", "ready", "error"
+            "path": path,
+            "name": name,
+            "implementation": None # Will hold the AlgorithmWrapper instance later
+        })
+        return challenger_id
+
+    def get_challenger(self, session_id: str, challenger_id: str):
+        session = self.get_session(session_id)
+        for c in session["challengers"]:
+            if c["id"] == challenger_id:
+                return c
+        return None
+
+session_manager = SessionManager()
+
+class ConnectionManager:
+    def __init__(self):
+        # session_id -> list of WebSockets
+        self.active_connections: Dict[str, List[WebSocket]] = defaultdict(list)
+
+    async def connect(self, websocket: WebSocket, session_id: str):
+        await websocket.accept()
+        self.active_connections[session_id].append(websocket)
+
+    def disconnect(self, websocket: WebSocket, session_id: str):
+        if session_id in self.active_connections:
+            if websocket in self.active_connections[session_id]:
+                self.active_connections[session_id].remove(websocket)
+
+    async def broadcast(self, session_id: str, message: dict):
+        if session_id in self.active_connections:
+            stale_connections: list[WebSocket] = []
+            for connection in self.active_connections[session_id]:
+                try:
+                    await connection.send_json(message)
+                except Exception as e:
+                    logging.warning(f"Failed to send to websocket: {e}")
+                    stale_connections.append(connection)
+            for connection in stale_connections:
+                self.disconnect(connection, session_id)
+
+ws_manager = ConnectionManager()
+
+
+def _validate_upload(
+    file_name: str,
+    content: bytes,
+    allowed_suffixes: set[str],
+    max_bytes: int,
+    label: str,
+) -> None:
+    if not file_name:
+        raise HTTPException(status_code=400, detail=f"{label} filename is required")
+    suffix = Path(file_name).suffix.lower()
+    if suffix not in allowed_suffixes:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid {label} file extension '{suffix or '(none)'}'. "
+                f"Allowed: {', '.join(sorted(allowed_suffixes))}"
+            ),
+        )
+    if not content:
+        raise HTTPException(status_code=400, detail=f"{label} file is empty")
+    if len(content) > max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"{label} file too large ({len(content)} bytes). "
+                f"Max allowed: {max_bytes} bytes"
+            ),
+        )
+
+
+def _extract_json_object(text: str) -> dict[str, Any]:
+    """Extract the first JSON object from plain text or fenced code."""
+    if not text:
+        return {}
+    fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    candidate = fence_match.group(1) if fence_match else None
+    if candidate:
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
+        try:
+            return json.loads(text[start:end + 1])
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def _extract_pdf_text(pdf_path: str, max_chars: int = 24000) -> str:
+    """
+    Best-effort PDF text extraction for ingestion prompts.
+    Falls back to byte-decoding if PDF parsing libraries are unavailable.
+    """
+    try:
+        from pypdf import PdfReader
+
+        reader = PdfReader(pdf_path)
+        chunks: list[str] = []
+        for page in reader.pages:
+            txt = page.extract_text() or ""
+            if txt.strip():
+                chunks.append(txt)
+            if sum(len(c) for c in chunks) >= max_chars:
+                break
+        joined = "\n\n".join(chunks)
+        if joined.strip():
+            return joined[:max_chars]
+    except Exception as e:
+        logging.warning("PDF text extraction fallback for %s: %s", pdf_path, e)
+
+    # Fallback: decode raw bytes (noisy but better than empty input).
+    with open(pdf_path, "rb") as f:
+        raw = f.read()
+    return raw.decode("latin-1", errors="ignore")[:max_chars]
+
+
+async def _broadcast_code_preview(
+    session_id: str,
+    challenger_id: str,
+    challenger_name: str,
+    code: str,
+) -> None:
+    """
+    Send a readable code preview to the challenger terminal without flooding WS.
+    """
+    if not code:
+        return
+    trimmed = code[:6000]
+    chunk_size = 1500
+    chunks = [trimmed[i:i + chunk_size] for i in range(0, len(trimmed), chunk_size)]
+    total = len(chunks)
+    for idx, chunk in enumerate(chunks, start=1):
+        await ws_manager.broadcast(session_id, {
+            "type": "log",
+            "source": "ImplementationAgent",
+            "challenger_id": challenger_id,
+            "message": (
+                f"Generated code for {challenger_name} "
+                f"(part {idx}/{total}):\n{chunk}"
+            ),
+        })
+
+
+def _run_nemotron_ingestion(
+    pdf_text: str,
+    challenger_name: str,
+    problem_hint: str,
+) -> dict[str, Any]:
+    """Use Nemotron (OpenAI-compatible API) to extract implementation-ready summary."""
+    # Path 1: DGX Spark / Ollama-style endpoint (no API key required).
+    if "11434" in NEMOTRON_BASE_URL or NEMOTRON_BASE_URL.rstrip("/").endswith("/api"):
+        base = NEMOTRON_BASE_URL.rstrip("/")
+        chat_url = f"{base}/chat" if base.endswith("/api") else f"{base}/api/chat"
+        prompt = (
+            f"Paper name: {challenger_name}\n"
+            f"Problem hint: {problem_hint or 'unknown'}\n\n"
+            "From this paper text, extract:\n"
+            "- algorithm_name\n"
+            "- objective\n"
+            "- key_steps (ordered list)\n"
+            "- data_structures\n"
+            "- parameters\n"
+            "- complexity\n"
+            "- implementation_notes\n"
+            "- assumptions\n\n"
+            "Respond as strict JSON object with exactly those keys.\n\n"
+            "Paper text:\n"
+            f"{pdf_text}"
+        )
+        with httpx.Client(timeout=60.0) as client:
+            resp = client.post(
+                chat_url,
+                json={
+                    "model": NEMOTRON_MODEL,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are an ingestion agent for algorithm papers. "
+                                "Extract actionable implementation details for another coding model. "
+                                "Return JSON only."
+                            ),
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    "stream": False,
+                    "format": "json",
+                },
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+        text = (payload.get("message", {}) or {}).get("content", "")
+        parsed = _extract_json_object(text)
+        if not parsed:
+            raise ValueError("Nemotron edge ingestion returned non-JSON output")
+        return parsed
+
+    # Path 2: OpenAI-compatible hosted endpoint.
+    backend = OpenAIBackend(
+        base_url=NEMOTRON_BASE_URL,
+        model=NEMOTRON_MODEL,
+        api_key=NEMOTRON_API_KEY,
+    )
+    system = (
+        "You are an ingestion agent for algorithm papers. "
+        "Extract actionable implementation details for another coding model. "
+        "Return JSON only."
+    )
+    prompt = (
+        f"Paper name: {challenger_name}\n"
+        f"Problem hint: {problem_hint or 'unknown'}\n\n"
+        "From this paper text, extract:\n"
+        "- algorithm_name\n"
+        "- objective\n"
+        "- key_steps (ordered list)\n"
+        "- data_structures\n"
+        "- parameters\n"
+        "- complexity\n"
+        "- implementation_notes\n"
+        "- assumptions\n\n"
+        "Respond as strict JSON object with exactly those keys.\n\n"
+        "Paper text:\n"
+        f"{pdf_text}"
+    )
+    resp = backend.generate(
+        messages=[{"role": "user", "content": prompt}],
+        system=system,
+        tools=None,
+        max_tokens=1400,
+    )
+    text = "\n".join(
+        block.text for block in resp.content if getattr(block, "type", "") == "text"
+    )
+    parsed = _extract_json_object(text)
+    if not parsed:
+        raise ValueError("Nemotron ingestion returned non-JSON output")
+    return parsed
+
+
+def _estimate_total_jobs(config: BenchmarkConfig, algorithm_count: int) -> int:
+    generated_instances = sum(
+        len(gen.sizes) * gen.count_per_size
+        for gen in config.instance_config.generators
+    )
+    total_instances = generated_instances + len(config.instance_config.custom_instances)
+    return max(1, algorithm_count) * total_instances * config.execution_config.runs_per_config
+
+
+def _apply_runtime_budget(
+    config: BenchmarkConfig,
+    execution_mode: str,
+    expected_algorithms: int,
+) -> tuple[BenchmarkConfig, str | None]:
+    """
+    Keep demo runs responsive by downscaling oversized benchmark configs.
+    This avoids the long post-implementation bottleneck before charts appear.
+    """
+    # Keep local runs snappy for live demo UX; modal can handle more work.
+    budget = 180 if execution_mode == "modal" else 48
+    current_jobs = _estimate_total_jobs(config, expected_algorithms)
+    if current_jobs <= budget:
+        return config, None
+
+    optimized = config.model_copy(deep=True)
+    # Tighten dimensions in order: runs_per_config -> count_per_size -> sizes.
+    while _estimate_total_jobs(optimized, expected_algorithms) > budget:
+        changed = False
+        ec = optimized.execution_config
+        if ec.runs_per_config > 1:
+            ec.runs_per_config -= 1
+            changed = True
+        else:
+            for gen in optimized.instance_config.generators:
+                if gen.count_per_size > 1:
+                    gen.count_per_size -= 1
+                    changed = True
+                    break
+            if not changed:
+                for gen in optimized.instance_config.generators:
+                    if len(gen.sizes) > 1:
+                        gen.sizes = gen.sizes[: max(1, len(gen.sizes) - 1)]
+                        changed = True
+                        break
+        if not changed:
+            break
+
+    new_jobs = _estimate_total_jobs(optimized, expected_algorithms)
+    message = (
+        f"Runtime budget applied: estimated jobs reduced from {current_jobs} to {new_jobs} "
+        f"for faster live demo feedback."
+    )
+    return optimized, message
+
+# Custom Log Handler for WebSockets
+class WebSocketLogHandler(logging.Handler):
+    def __init__(self, session_id: str, ws_manager, loop):
+        super().__init__()
+        self.session_id = session_id
+        self.ws_manager = ws_manager
+        self.loop = loop
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            # Schedule the broadcast in the main event loop
+            asyncio.run_coroutine_threadsafe(
+                self.ws_manager.broadcast(self.session_id, {
+                    "type": "log",
+                    "source": "Runner",
+                    "message": msg
+                }),
+                self.loop
+            )
+        except Exception:
+            self.handleError(record)
 
 # ─── Data Models ──────────────────────────────────────────────────────────────
 
-class FileAttachment(BaseModel):
+class StartSessionResponse(BaseModel):
+    session_id: str
+    detected_class: Optional[str]
     filename: str
-    content_base64: str  # base64-encoded bytes
 
+class ChallengerResponse(BaseModel):
+    challenger_id: str
+    status: str
+    message: str
 
-class BenchmarkRequest(BaseModel):
-    query: str
-    execution_mode: str = "local"
+class ConfigureResponse(BaseModel):
+    config: Dict[str, Any]
+    message: str
+
+class RunSessionRequest(BaseModel):
+    execution_mode: str = "local"  # "local" or "modal"
     modal_token_id: Optional[str] = None
     modal_token_secret: Optional[str] = None
 
+class BenchmarkRequest(BaseModel):
+    query: str
 
 class SeriesData(BaseModel):
     name: str
     color: str
     dataKey: str
-
 
 class BenchmarkResponse(BaseModel):
     title: str
@@ -78,20 +455,10 @@ class BenchmarkResponse(BaseModel):
     series: List[SeriesData]
     data: List[Dict[str, Any]]
 
-
-# Chat models (multi-turn orchestrator)
-class ChatRequest(BaseModel):
-    session_id: Optional[str] = None
-    message: str
-    execution_mode: str = "local"  # local | modal (first turn)
-    llm_backend: str = "claude"  # claude | nemotron (first turn)
-    pdfs: Optional[List[FileAttachment]] = None
-    custom_algorithm_file: Optional[FileAttachment] = None  # .py file
-
-
-# ─── Toy Algorithms (Legacy) ─────────────────────────────────────────────────
+# ─── Toy Algorithms (Reused from demo_phase1.py) ──────────────────────────────
 
 class GreedyVertexCover(AlgorithmWrapper):
+    """Simple greedy: repeatedly pick the endpoint of any uncovered edge."""
     name = "greedy_vc"
 
     def solve(self, instance: dict, timeout: float = 60.0) -> dict:
@@ -102,6 +469,7 @@ class GreedyVertexCover(AlgorithmWrapper):
             if u not in covered and v not in covered:
                 cover.append(u)
                 covered.add(u)
+        # Double check
         for edge in instance["edges"]:
             u, v = edge["source"], edge["target"]
             if u not in covered and v not in covered:
@@ -111,6 +479,7 @@ class GreedyVertexCover(AlgorithmWrapper):
 
 
 class RandomVertexCover(AlgorithmWrapper):
+    """Picks endpoints of edges at random until all are covered."""
     name = "random_vc"
 
     def solve(self, instance: dict, timeout: float = 60.0) -> dict:
@@ -125,6 +494,7 @@ class RandomVertexCover(AlgorithmWrapper):
                 chosen = random.choice([u, v])
                 cover.append(chosen)
                 covered.add(chosen)
+        # Second pass
         for edge in instance["edges"]:
             u, v = edge["source"], edge["target"]
             if u not in covered and v not in covered:
@@ -132,602 +502,619 @@ class RandomVertexCover(AlgorithmWrapper):
                 covered.add(u)
         return {"solution": {"vertices": cover}, "metadata": {"strategy": "random"}}
 
-
 class RandomMaxCut(AlgorithmWrapper):
+    """Randomly partitions vertices into two sets (0 and 1)."""
     name = "random_max_cut"
 
     def solve(self, instance: dict, timeout: float = 60.0) -> dict:
         import random
+        partition = []
         n_nodes = len(instance["nodes"])
+        # If nodes are just a count, we assume 0..n-1.
+        # If instance["nodes"] is a list of metadata, we just need the count.
+        # But wait, instance["nodes"] in Benchwarmer is usually a list of dicts or just indices?
+        # Let's check ErdosRenyiGenerator. usually it's list of ints.
+        # Actually, let's just use the length.
+        
         partition = [random.choice([0, 1]) for _ in range(n_nodes)]
+        
         return {"solution": {"partition": partition}, "metadata": {"strategy": "random"}}
 
+# ─── Helper Functions ────────────────────────────────────────────────────────—
 
-# ─── Helper Functions ────────────────────────────────────────────────────────
+def run_demo_benchmark(query: str) -> pd.DataFrame:
+    """
+    Runs a hardcoded benchmark for demonstration purposes.
+    In a real scenario, 'query' would be used to generate the config.
+    """
+    print(f"Received query: {query}")
+    
+    config = BenchmarkConfig(
+        problem_class="minimum_vertex_cover",
+        problem_description=f"Demo: {query}",
+        objective="minimize",
+        instance_config=InstanceConfig(
+            generators=[
+                GeneratorConfig(type="erdos_renyi", sizes=[20, 50, 100], count_per_size=2, params={"p": 0.3}),
+                GeneratorConfig(type="grid_2d", sizes=[25, 36, 100], count_per_size=2),
+            ]
+        ),
+        execution_config={"timeout_seconds": 30, "runs_per_config": 2},
+    )
 
-def _json_default(obj: Any) -> Any:
-    """Custom JSON serializer for numpy/pandas types."""
-    if hasattr(obj, "item"):
-        return obj.item()
-    if isinstance(obj, float) and (obj != obj):  # NaN
-        return None
-    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+    runner = BenchmarkRunner(config)
+    runner.register_algorithm(GreedyVertexCover())
+    runner.register_algorithm(RandomVertexCover())
 
+    return runner.run()
 
-def _safe_json(obj: Any) -> str:
-    """JSON-encode with numpy/pandas safety."""
-    return json.dumps(obj, default=_json_default, ensure_ascii=False)
-
-
-def transform_results(df: pd.DataFrame) -> BenchmarkResponse:
-    """Transforms the pandas DataFrame into the frontend's expected JSON format."""
+def transform_results(df: pd.DataFrame, problem_class: str = "unknown") -> BenchmarkResponse:
+    """
+    Transforms the pandas DataFrame into the frontend's expected JSON format.
+    """
+    # Filter for successes
     success_df = df[df["status"] == "success"].copy()
 
     if success_df.empty:
         raise HTTPException(status_code=500, detail="No successful benchmark runs generated.")
 
+    # Group by problem_size and algorithm to get mean objective value
+    # We want to plot: x=problem_size, y=objective_value, series=algorithm
+
+    # Calculate aggregation
     agg = success_df.groupby(["algorithm_name", "problem_size"])["objective_value"].mean().reset_index()
+
+    # Pivot to get: index=problem_size, columns=algorithm_name, values=objective_value
     pivot = agg.pivot(index="problem_size", columns="algorithm_name", values="objective_value").reset_index()
 
+    # Construct data list
     data = []
     for _, row in pivot.iterrows():
-        item: Dict[str, Any] = {"x": int(row["problem_size"])}
+        item = {"x": int(row["problem_size"])}
         for col in pivot.columns:
             if col != "problem_size":
+                # Handle NaN if an algo failed for a specific size
                 val = row[col]
                 if pd.notna(val):
                     item[col] = float(val)
         data.append(item)
 
+    # Sort data by x (problem_size)
     data.sort(key=lambda d: d["x"])
 
+    # Define series based on available algorithms
     algorithms = [c for c in pivot.columns if c != "problem_size"]
-    colors = ["#22c55e", "#3b82f6", "#ef4444", "#f59e0b", "#a855f7", "#ec4899"]
-    series = [
-        SeriesData(name=algo, color=colors[i % len(colors)], dataKey=algo)
-        for i, algo in enumerate(algorithms)
-    ]
+    series = []
+    colors = ["#ef4444", "#3b82f6", "#10b981", "#f59e0b"] # Red, Blue, Green, Amber
+
+    for i, algo in enumerate(algorithms):
+        series.append(SeriesData(
+            name=algo,
+            color=colors[i % len(colors)],
+            dataKey=algo
+        ))
+
+    # Problem-specific labels
+    labels = {
+        "maximum_cut": {
+            "title": "Maximum Cut Algorithm Comparison",
+            "ylabel": "Cut Value (edges crossing partition)",
+        },
+        "minimum_vertex_cover": {
+            "title": "Vertex Cover Algorithm Comparison",
+            "ylabel": "Vertex Cover Size",
+        },
+    }
+
+    problem_labels = labels.get(problem_class, {
+        "title": f"{problem_class.replace('_', ' ').title()} Comparison",
+        "ylabel": "Objective Value",
+    })
 
     return BenchmarkResponse(
-        title="Benchmark Results",
-        xLabel="Problem Size",
-        yLabel="Objective Value",
+        title=problem_labels["title"],
+        xLabel="Graph Size (Nodes)",
+        yLabel=problem_labels["ylabel"],
         series=series,
-        data=data,
+        data=data
     )
 
+# ─── Endpoints ────────────────────────────────────────────────────────────────
 
-def _build_chart(df: pd.DataFrame) -> Optional[BenchmarkResponse]:
-    """Build chart from results dataframe, or None on failure."""
-    try:
-        return transform_results(df)
-    except Exception:
-        return None
+# ─── New API Endpoints ──────────────────────────────────────────────────────
 
+@app.post("/api/session/start", response_model=StartSessionResponse)
+async def start_session(file: UploadFile = File(...)):
+    """Step 1: Upload User Algorithm"""
+    session_id = session_manager.create_session()
+    session = session_manager.get_session(session_id)
 
-# ─── Session store for multi-turn chat ────────────────────────────────────────
+    content = await file.read()
+    _validate_upload(
+        file_name=file.filename or "",
+        content=content,
+        allowed_suffixes={".py"},
+        max_bytes=MAX_PY_UPLOAD_BYTES,
+        label="Python",
+    )
 
-_SESSIONS: Dict[str, Dict[str, Any]] = {}  # session_id -> {agent, messages}
+    # Save user file
+    suffix = Path(file.filename).suffix or ".py"
+    user_path = os.path.join(session["base_dir"], f"user_algo{suffix}")
 
-from benchwarmer.database import init_db, save_message, get_messages
+    with open(user_path, "wb") as f:
+        f.write(content)
+        
+    session["user_algo_path"] = user_path
+    session["user_algo_name"] = file.filename
+    
+    # Quick analysis to guess problem class (naive regex for now)
+    # in the future we can use an LLM or AST
+    code_str = content.decode("utf-8", errors="ignore")
+    detected_class = "unknown"
+    if "partition" in code_str or "cut" in code_str.lower():
+        detected_class = "maximum_cut"
+    elif "cover" in code_str or "vertex" in code_str.lower():
+        detected_class = "minimum_vertex_cover"
+        
+    session["problem_class"] = detected_class
+    
+    logging.info(f"Session {session_id} started with {file.filename} (detected: {detected_class})")
+    
+    return StartSessionResponse(
+        session_id=session_id,
+        detected_class=detected_class,
+        filename=file.filename
+    )
 
-# Initialize DB on startup
-@app.on_event("startup")
-def on_startup():
-    init_db()
+@app.post("/api/session/{session_id}/challenger", response_model=ChallengerResponse)
+async def add_challenger(
+    session_id: str,
+    type: str = Form(...), # "pdf" or "baseline"
+    file: Optional[UploadFile] = File(None)
+):
+    """Step 2: Add a Challenger (PDF or Baseline)"""
+    session = session_manager.get_session(session_id)
+    
+    if type == "pdf":
+        if not file:
+            raise HTTPException(status_code=400, detail="PDF file required")
 
-@app.get("/api/chat/{session_id}")
-async def get_chat_history(session_id: str):
-    """Retrieve chat history for a given session."""
-    messages = get_messages(session_id)
-    if not messages:
-        return [] 
-    return messages
-
-from benchwarmer.database import get_all_sessions, delete_session, rename_session
-
-@app.get("/api/sessions")
-async def get_sessions():
-    """Retrieve all chat sessions."""
-    return get_all_sessions()
-
-@app.delete("/api/sessions/{session_id}")
-async def remove_session(session_id: str):
-    """Delete a chat session and all its messages."""
-    delete_session(session_id)
-    _SESSIONS.pop(session_id, None)
-    return {"ok": True}
-
-@app.patch("/api/sessions/{session_id}")
-async def update_session(session_id: str, body: dict):
-    """Rename a chat session."""
-    title = body.get("title", "").strip()
-    if not title:
-        raise HTTPException(status_code=400, detail="Title required")
-    rename_session(session_id, title)
-    return {"ok": True}
-
-from benchwarmer.database import get_all_algorithms, get_algorithm_code
-
-@app.get("/api/algorithms")
-async def list_algorithms():
-    """Retrieve all generated algorithms."""
-    return get_all_algorithms()
-
-@app.get("/api/algorithms/{name}")
-async def get_algorithm(name: str):
-    """Retrieve code for a specific algorithm."""
-    code = get_algorithm_code(name)
-    if not code:
-        raise HTTPException(status_code=404, detail="Algorithm not found")
-    return {"name": name, "code": code}
-
-
-
-# ─── Session processing status ────────────────────────────────────────────────
-
-@app.get("/api/chat/{session_id}/status")
-async def get_chat_status(session_id: str):
-    """Check if the backend is still processing a turn for this session."""
-    sess = _SESSIONS.get(session_id)
-    if sess:
-        return {"processing": sess.get("processing", False)}
-    return {"processing": False}
-
-
-# ─── SSE Chat Endpoint ───────────────────────────────────────────────────────
-
-@app.post("/api/chat")
-async def chat_turn(request: ChatRequest):
-    """
-    Multi-turn chat endpoint — mirrors the CLI orchestrator flow.
-
-    The orchestrator runs in a **background thread** that always saves
-    its result to the DB — even if the SSE client disconnects mid-stream
-    (e.g. browser refresh).  The SSE generator simply reads from the
-    shared event queue and forwards events to the client.
-
-    Returns a **Server-Sent Events** stream with real-time progress:
-        data: {"type": "thinking"}
-        data: {"type": "tool_start", "tool": "run_intake", ...}
-        data: {"type": "tool_end",   "tool": "run_intake", "result": "..."}
-        data: {"type": "done", "session_id": "...", "reply": "...", "chart": ...}
-        data: {"type": "error", "error": "..."}
-    """
-    session_id = request.session_id
-    agent: Optional[OrchestratorAgent] = None
-    messages: list = []
-
-    # ── Session setup (synchronous, before streaming) ──────────────────────
-    if session_id and session_id in _SESSIONS:
-        sess = _SESSIONS[session_id]
-        # If session is already processing a turn, reject the new request
-        if sess.get("processing", False):
-            async def busy_stream():
-                yield f"data: {_safe_json({'type': 'error', 'session_id': session_id, 'error': 'A turn is still being processed. Please wait.'})}\n\n"
-            return StreamingResponse(
-                busy_stream(),
-                media_type="text/event-stream",
-                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-            )
-        agent = sess["agent"]
-        messages = sess["messages"]
-    elif session_id and session_id not in _SESSIONS:
-        # Session was lost (e.g. backend restarted). Tell the frontend.
-        async def expired_stream():
-            yield f"data: {_safe_json({'type': 'error', 'session_id': session_id, 'error': 'Session expired — the backend was restarted. Please start a new conversation.'})}\n\n"
-        return StreamingResponse(
-            expired_stream(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        content = await file.read()
+        _validate_upload(
+            file_name=file.filename or "",
+            content=content,
+            allowed_suffixes={".pdf"},
+            max_bytes=MAX_PDF_UPLOAD_BYTES,
+            label="PDF",
         )
+
+        suffix = Path(file.filename).suffix or ".pdf"
+        pdf_path = os.path.join(session["base_dir"], f"paper_{uuid.uuid4()}{suffix}")
+
+        with open(pdf_path, "wb") as f:
+            f.write(content)
+            
+        cid = session_manager.add_challenger(session_id, "pdf", pdf_path, file.filename)
+        
+        # Trigger background analysis (using asyncio task to not block)
+        asyncio.create_task(analyze_challenger(session_id, cid))
+        
+        return ChallengerResponse(challenger_id=cid, status="analyzing", message="Analyzing PDF...")
+        
+    elif type == "baseline":
+        # Add a baseline like Random or Greedy
+        name = "Baseline (Random)"
+        cid = session_manager.add_challenger(session_id, "baseline", "builtin", name)
+        
+        # Mark ready immediately
+        c = session_manager.get_challenger(session_id, cid)
+        c["status"] = "ready"
+        
+        return ChallengerResponse(challenger_id=cid, status="ready", message="Baseline added")
+        
     else:
-        pdf_paths: list[str] = []
-        custom_algo_path: Optional[str] = None
+        raise HTTPException(status_code=400, detail=f"Unknown type: {type}")
 
-        if request.pdfs:
-            tmpdir = tempfile.mkdtemp(prefix="bw_pdfs_")
-            for pdf in request.pdfs:
-                raw = base64.b64decode(pdf.content_base64)
-                name = os.path.basename(pdf.filename) or "paper.pdf"
-                path = os.path.join(tmpdir, name)
-                with open(path, "wb") as f:
-                    f.write(raw)
-                pdf_paths.append(path)
+async def analyze_challenger(session_id: str, challenger_id: str):
+    """Background task to ingest PDF and prepare implementation context."""
+    challenger = None
+    try:
+        session = session_manager.get_session(session_id)
+        challenger = session_manager.get_challenger(session_id, challenger_id)
+        if not challenger:
+            raise ValueError("Challenger not found")
+        
+        await ws_manager.broadcast(session_id, {
+            "type": "challenger_update",
+            "challenger_id": challenger_id,
+            "status": "analyzing",
+            "message": "Reading PDF content..."
+        })
 
-        if request.custom_algorithm_file:
-            raw = base64.b64decode(request.custom_algorithm_file.content_base64)
-            tmpdir = tempfile.mkdtemp(prefix="bw_algo_")
-            name = os.path.basename(request.custom_algorithm_file.filename) or "algo.py"
-            if not name.endswith(".py"):
-                name += ".py"
-            custom_algo_path = os.path.join(tmpdir, name)
-            with open(custom_algo_path, "wb") as f:
-                f.write(raw)
+        loop = asyncio.get_event_loop()
+        pdf_text = await loop.run_in_executor(None, lambda: _extract_pdf_text(challenger["path"]))
+        problem_hint = session.get("problem_class") or "unknown"
 
-        # Resolve LLM backend — "claude" or "nemotron"
-        backend_choice = (request.llm_backend or "claude").lower()
-        nemotron_url = os.environ.get("NEMOTRON_URL", "http://10.19.179.173:11434/v1")
-        nemotron_model = os.environ.get(
-            "NEMOTRON_MODEL",
-            "hf.co/unsloth/Nemotron-3-Nano-30B-A3B-GGUF:Q4_K_M",
-        )
+        ingestion_source = "none"
+        ingestion_payload: dict[str, Any] = {}
 
-        agent = OrchestratorAgent(
-            execution_mode=request.execution_mode or "local",
-            intake_backend=backend_choice,
-            pdf_paths=pdf_paths or None,
-            custom_algo_path=custom_algo_path,
-            nemotron_url=nemotron_url if backend_choice == "nemotron" else None,
-            nemotron_model=nemotron_model if backend_choice == "nemotron" else None,
-        )
-        logger.info("Session created with LLM backend: %s", backend_choice)
-
-        # Seed conversation so the orchestrator knows about attachments
-        if pdf_paths or custom_algo_path:
-            pdf_names = [os.path.basename(p) for p in pdf_paths] if pdf_paths else []
-            algo_name = os.path.basename(custom_algo_path) if custom_algo_path else None
-            parts = []
-            if pdf_names:
-                parts.append(f"I have uploaded PDF papers: {', '.join(pdf_names)}.")
-            if algo_name:
-                parts.append(f"I have also uploaded my custom algorithm implementation: {algo_name}.")
-            parts.append("I'll describe my problem now.")
-            messages.append({"role": "user", "content": " ".join(parts)})
-
-            reply_parts = []
-            if pdf_names:
-                reply_parts.append(
-                    "I see your papers. I'll extract the algorithm specifications from them during intake "
-                    "so you won't need to specify algorithms separately."
+        # Primary ingestion path: Nemotron (OpenAI-compatible hosted or edge server).
+        if NEMOTRON_BASE_URL:
+            await ws_manager.broadcast(session_id, {
+                "type": "log",
+                "source": "IngestionAgent",
+                "challenger_id": challenger_id,
+                "message": (
+                    f"Nemotron ingestion starting for {challenger['name']} "
+                    f"(endpoint: {NEMOTRON_BASE_URL})..."
+                ),
+            })
+            try:
+                ingestion_payload = await loop.run_in_executor(
+                    None,
+                    lambda: _run_nemotron_ingestion(
+                        pdf_text=pdf_text,
+                        challenger_name=challenger["name"],
+                        problem_hint=problem_hint,
+                    ),
                 )
-            if algo_name:
-                reply_parts.append(
-                    f"Your custom algorithm ({algo_name}) is loaded and will be included in the benchmark automatically."
-                )
-            reply_parts.append("Go ahead — describe your optimization problem.")
-            messages.append({"role": "assistant", "content": " ".join(reply_parts)})
+                ingestion_source = "nemotron"
+            except Exception as e:
+                await ws_manager.broadcast(session_id, {
+                    "type": "log",
+                    "source": "IngestionAgent",
+                    "challenger_id": challenger_id,
+                    "message": f"Nemotron ingestion failed, using fallback context: {e}",
+                })
 
-        session_id = str(uuid.uuid4())
-        _SESSIONS[session_id] = {"agent": agent, "messages": messages}
-
-    # Save user message to DB
-    save_message(session_id, "user", request.message)
-
-    # ── Launch orchestrator in a background thread ─────────────────────────
-    # The thread always saves the result to DB when it finishes,
-    # regardless of whether the SSE client is still connected.
-
-    loop = asyncio.get_running_loop()
-    q: asyncio.Queue = asyncio.Queue()
-    _tools_called: list[str] = []
-    _tool_records: list[dict] = []  # full tool call records for DB persistence
-    _ui_metadata: dict = {}  # algorithmChoices, choicePrompt, etc.
-
-    _last_tool_input: dict = {}
-
-    def progress_cb(event: dict):
-        """Called from the worker thread — enqueue event to the async queue."""
-        if event.get("type") == "tool_start":
-            _tools_called.append(event.get("tool", ""))
-            _last_tool_input.clear()
-            _last_tool_input.update(event.get("input", {}))
-            _tool_records.append({"tool": event.get("tool", ""), "status": "running"})
-        elif event.get("type") == "tool_end":
-            # Mark the matching tool record as completed
-            for t in reversed(_tool_records):
-                if t["tool"] == event.get("tool") and t["status"] == "running":
-                    t["status"] = "completed"
-                    t["result"] = event.get("result")
-                    break
-        try:
-            loop.call_soon_threadsafe(q.put_nowait, event)
-        except RuntimeError:
-            pass  # loop closed — SSE client gone, that's fine
-
-        # Capture choice_prompt events for DB persistence
-        if event.get("type") == "choice_prompt":
-            _ui_metadata["choicePrompt"] = {
-                "id": event.get("id"),
-                "title": event.get("title"),
-                "options": event.get("options"),
-                "multiSelect": event.get("multi_select", False),
+        if not ingestion_payload:
+            ingestion_source = "fallback"
+            ingestion_payload = {
+                "algorithm_name": challenger["name"],
+                "objective": f"Optimize {problem_hint}",
+                "key_steps": ["Extract core heuristic from paper text", "Implement solve() for problem class"],
+                "data_structures": [],
+                "parameters": {},
+                "complexity": "unknown",
+                "implementation_notes": pdf_text[:3000],
+                "assumptions": ["Paper text may be incomplete"],
             }
 
-        # After intake completes, emit structured algorithm choices for the UI
-        if (
-            event.get("type") == "tool_end"
-            and event.get("tool") == "run_intake"
-            and agent is not None
-            and agent.state.algo_specs
-            and agent.state.preferred_algo_spec_indices is None
-        ):
-            algos = [
-                {
-                    "index": i,
-                    "name": s.name,
-                    "approach": s.approach,
-                    "source": s.source,
-                }
-                for i, s in enumerate(agent.state.algo_specs)
-            ]
-            _ui_metadata["algorithmChoices"] = algos
-            try:
-                loop.call_soon_threadsafe(q.put_nowait, {
-                    "type": "algorithm_select",
-                    "algorithms": algos,
-                })
-            except RuntimeError:
-                pass
+        challenger["ingestion"] = {
+            "source": ingestion_source,
+            "summary": ingestion_payload,
+        }
 
-        # After code_algorithm completes, emit algorithm_coded events (AI-coded only)
-        if (
-            event.get("type") == "tool_end"
-            and event.get("tool") == "code_algorithm"
-            and agent is not None
-            and agent.state.algorithms
-        ):
-            custom_name = agent.state.custom_algo_name
-            for algo_wrapper in agent.state.algorithms:
-                name = getattr(algo_wrapper, "name", None)
-                if name and name != custom_name:
-                    try:
-                        loop.call_soon_threadsafe(q.put_nowait, {
-                            "type": "algorithm_coded",
-                            "name": name,
-                        })
-                    except RuntimeError:
-                        pass
+        summary_text = json.dumps(ingestion_payload, indent=2)
+        challenger["ingestion_context"] = (
+            f"Ingestion source: {ingestion_source}\n"
+            f"Structured summary:\n{summary_text}"
+        )
 
-        # After load_suite with list_suites=true, emit suite choices
-        if (
-            event.get("type") == "tool_end"
-            and event.get("tool") == "load_suite"
-            and agent is not None
-        ):
-            result_text = event.get("result", "")
-            if "Available benchmark suites" in result_text:
-                # Parse suite info from the tool result
-                import re as _re
-                suite_opts = []
-                for m in _re.finditer(
-                    r"•\s+(\w+):\s+(.+?)\((\d+)\s+instances?\)\s*\n\s+(.+)",
-                    result_text,
-                ):
-                    suite_opts.append({
-                        "value": m.group(1),
-                        "label": m.group(2).strip(),
-                        "description": f"{m.group(3)} instances — {m.group(4).strip()}",
-                    })
-                if suite_opts:
-                    _ui_metadata["choicePrompt"] = {
-                        "id": "benchmark_suite",
-                        "title": "Select a benchmark suite",
-                        "options": suite_opts,
-                        "multiSelect": False,
-                    }
-                    try:
-                        loop.call_soon_threadsafe(q.put_nowait, {
-                            "type": "choice_prompt",
-                            "id": "benchmark_suite",
-                            "title": "Select a benchmark suite",
-                            "options": suite_opts,
-                            "multi_select": False,
-                        })
-                    except RuntimeError:
-                        pass
-            elif "Instances in" in result_text:
-                # Parse instance list from the tool result
-                import re as _re
-                inst_opts = []
-                for m in _re.finditer(
-                    r"•\s+([\w._-]+)\s+\((\d+)\s+nodes?\)",
-                    result_text,
-                ):
-                    inst_opts.append({
-                        "value": m.group(1),
-                        "label": m.group(1),
-                        "description": f"{m.group(2)} nodes",
-                    })
-                if inst_opts:
-                    _ui_metadata["choicePrompt"] = {
-                        "id": "benchmark_instances",
-                        "title": "Select instances to load",
-                        "options": inst_opts,
-                        "multiSelect": True,
-                    }
-                    try:
-                        loop.call_soon_threadsafe(q.put_nowait, {
-                            "type": "choice_prompt",
-                            "id": "benchmark_instances",
-                            "title": "Select instances to load",
-                            "options": inst_opts,
-                            "multi_select": True,
-                        })
-                    except RuntimeError:
-                        pass
+        await ws_manager.broadcast(session_id, {
+            "type": "challenger_update",
+            "challenger_id": challenger_id,
+            "status": "ready",
+            "message": f"Analysis complete via {ingestion_source}. Ready to implement."
+        })
+        
+        challenger["status"] = "ready"
+        
+    except Exception as e:
+        logging.error(f"Analysis failed: {e}")
+        if challenger is not None:
+            challenger["status"] = "error"
+        await ws_manager.broadcast(session_id, {
+            "type": "challenger_error",
+            "challenger_id": challenger_id,
+            "message": str(e)
+        })
 
-    # Emit session_start immediately so the frontend can persist the session ID
-    q.put_nowait({"type": "session_start", "session_id": session_id})
+@app.post("/api/session/{session_id}/configure", response_model=ConfigureResponse)
+async def configure_session(session_id: str, preferences: str = Form(...)):
+    """Step 3: Configure Benchmark Environment (Intake Agent)"""
+    session = session_manager.get_session(session_id)
+    
+    # Run Intake Agent
+    # For now, we wrap it to be async-ish (it's sync under the hood)
+    intake_agent = IntakeAgent()
+    
+    # We might want to inject knowledge about the problem class if we detected it
+    context = ""
+    if session["problem_class"]:
+        context = f"The user is solving {session['problem_class']}. "
+        
+    full_query = f"{context}{preferences}\n\n[SYSTEM: This is an API request. Generate config immediately.]"
+    
+    try:
+        # Run in threadpool to not block event loop
+        loop = asyncio.get_event_loop()
+        config = await loop.run_in_executor(None, lambda: intake_agent.run(full_query, interactive=False))
+        
+        # Save config to session
+        session["config"] = config
+        
+        return ConfigureResponse(config=config.model_dump(), message="Configuration generated")
+    except Exception as e:
+        logging.error(f"Intake agent failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-    # Mark session as actively processing
-    _SESSIONS[session_id]["processing"] = True
-    _SESSIONS[session_id]["event_queue"] = q
-
-    _agent = agent
-    _messages = messages
-    _sid = session_id
-    _user_msg = request.message
-
-    def _run_orchestrator():
-        """Blocking orchestrator work — runs in a daemon thread."""
-        try:
-            msgs_out, reply = _agent.run_one_turn(
-                _messages, _user_msg, progress_cb=progress_cb
-            )
-            _SESSIONS[_sid]["messages"] = msgs_out
-
-            # Handle plot image
-            plot_image = None
-            if "analyze_results" in _tools_called and _agent.state.last_plot_path:
-                plot_path = _agent.state.last_plot_path
-                if os.path.exists(plot_path):
-                    import base64 as _b64
-                    with open(plot_path, "rb") as f:
-                        encoded = _b64.b64encode(f.read()).decode("ascii")
-                    plot_image = f"data:image/png;base64,{encoded}"
-                _agent.state.last_plot_path = None
-
-            # Emit interactive choice prompts based on pipeline state
-            # Only show instance source if code_algorithm was called this turn
-            # AND user didn't already specify an instance source preference
-            if (
-                "code_algorithm" in _tools_called
-                and _agent.state.instance_source is None
-                and _agent.state.preferred_instance_source is None
-                and _agent.state.algorithms
-                and len(_agent.state.algorithms) > 0
-            ):
-                gens = (
-                    _agent.state.config.instance_config.generators
-                    if _agent.state.config else []
-                )
-                gen_desc = ""
-                if gens:
-                    gen_names = [g.type for g in gens]
-                    gen_desc = f" ({', '.join(gen_names)})"
-                instance_source_prompt = {
-                    "id": "instance_source",
-                    "title": "How would you like to provide instances?",
-                    "options": [
-                        {
-                            "value": "generators",
-                            "label": "Generators",
-                            "description": f"Use proposed graph generators{gen_desc}",
-                        },
-                        {
-                            "value": "custom",
-                            "label": "Custom JSON",
-                            "description": "Load from your own instance file",
-                        },
-                        {
-                            "value": "benchmark suite",
-                            "label": "Benchmark Suite",
-                            "description": "Use standard benchmark instances (DIMACS, BiqMac, etc.)",
-                        },
-                    ],
-                    "multiSelect": False,
-                }
-                _ui_metadata["choicePrompt"] = instance_source_prompt
-                try:
-                    loop.call_soon_threadsafe(q.put_nowait, {
-                        "type": "choice_prompt",
-                        **instance_source_prompt,
-                        "multi_select": False,
-                    })
-                except RuntimeError:
-                    pass
-
-            # Always persist to DB (even if the SSE client disconnected)
-            save_message(
-                session_id=_sid, role="assistant",
-                content=reply,
-                tools=_tool_records if _tool_records else None,
-                plot_image=plot_image,
-                metadata=_ui_metadata if _ui_metadata else None,
-            )
-
-            # Notify queue — the SSE generator will pick this up if connected
-            try:
-                loop.call_soon_threadsafe(q.put_nowait, {
-                    "type": "done", "session_id": _sid,
-                    "reply": reply, "plot_image": plot_image,
-                })
-            except RuntimeError:
-                pass
-
-        except Exception as e:
-            logger.exception("Orchestrator error: %s", e)
-            try:
-                loop.call_soon_threadsafe(q.put_nowait, {
-                    "type": "error", "session_id": _sid, "error": str(e),
-                })
-            except RuntimeError:
-                pass
-        finally:
-            _SESSIONS[_sid]["processing"] = False
-
-    thread = threading.Thread(target=_run_orchestrator, daemon=True)
-    thread.start()
-
-    # ── SSE stream — just reads from the queue ────────────────────────────
-    async def event_stream():
-        try:
-            while True:
-                try:
-                    event = await asyncio.wait_for(q.get(), timeout=2.0)
-                    yield f"data: {_safe_json(event)}\n\n"
-                    # Terminal events — stop streaming
-                    if event.get("type") in ("done", "error"):
-                        break
-                except asyncio.TimeoutError:
-                    if not _SESSIONS.get(_sid, {}).get("processing", False):
-                        # Orchestrator finished while we weren't reading — drain
-                        while not q.empty():
-                            evt = q.get_nowait()
-                            yield f"data: {_safe_json(evt)}\n\n"
-                        break
-                    # Keep-alive heartbeat so proxies don't kill the connection
-                    yield f"data: {_safe_json({'type': 'heartbeat'})}\n\n"
-        except Exception as e:
-            logger.exception("Stream error: %s", e)
-            yield f"data: {_safe_json({'type': 'error', 'session_id': _sid, 'error': str(e)})}\n\n"
-
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
+@app.post("/api/session/{session_id}/run", response_model=BenchmarkResponse)
+async def run_session(session_id: str, request: RunSessionRequest = RunSessionRequest()):
+    """Step 4: Execute Benchmark (Live)"""
+    session = session_manager.get_session(session_id)
+    if not session["config"]:
+        raise HTTPException(status_code=400, detail="Session not configured")
+        
+    config = session["config"]
+    
+    # Background this so we can return immediately? 
+    # Actually, user might want to await? 
+    # No, with WebSockets, we should probably return "started" and stream the rest.
+    # checking the return type... BenchmarkResponse. 
+    # If the frontend expects a response, we must wait. 
+    # BUT user wants "Live Terminal".
+    # So we should probably return a "Job Started" response and let WS handle the data.
+    # However, existing frontend expects BenchmarkResponse. 
+    # We are changing the frontend anyway. 
+    # Let's change this endpoint to return { "status": "started" } and stream results via WS.
+    
+    asyncio.create_task(safe_execute_session_benchmark(session_id, request))
+    
+    # Return empty/partial response or change the model. 
+    # For now, let's keep the model but return empty data, frontend will ignore it 
+    # if it's listening to WS.
+    return BenchmarkResponse(
+        title="Benchmark Running...",
+        xLabel="Size",
+        yLabel="Value",
+        series=[],
+        data=[]
     )
 
 
-# ─── Legacy one-shot endpoint ────────────────────────────────────────────────
-
-@app.post("/api/benchmark", response_model=BenchmarkResponse)
-async def run_benchmark_endpoint(request: BenchmarkRequest):
+async def safe_execute_session_benchmark(session_id: str, request: RunSessionRequest):
+    """Guarded background runner so websocket clients always receive terminal error status."""
     try:
-        logging.info(f"Processing query: {request.query!r}")
+        await execute_session_benchmark(session_id, request)
+    except Exception as e:
+        logging.error("Benchmark task failed: %s", e, exc_info=True)
+        await ws_manager.broadcast(session_id, {
+            "type": "error",
+            "message": f"Benchmark failed: {e}",
+        })
+        await ws_manager.broadcast(session_id, {"type": "status", "status": "error"})
 
-        agent = IntakeAgent()
-        config = agent.run(request.query, interactive=False)
-        logging.info(f"Generated config: {config}")
-
-        runner = BenchmarkRunner(config)
-
-        if config.problem_class == "minimum_vertex_cover":
-            runner.register_algorithm(GreedyVertexCover())
-            runner.register_algorithm(RandomVertexCover())
-        elif config.problem_class == "maximum_cut":
-            runner.register_algorithm(RandomMaxCut())
-        else:
-            logging.warning(f"Unknown problem class {config.problem_class}")
-            runner.register_algorithm(GreedyVertexCover())
-            runner.register_algorithm(RandomVertexCover())
-
-        df = runner.run(
-            execution_mode=request.execution_mode,
+async def execute_session_benchmark(session_id: str, request: RunSessionRequest):
+    """Orchestrates the parallel execution of all agents/algorithms"""
+    session = session_manager.get_session(session_id)
+    base_config = session["config"]
+    expected_algorithms = (1 if session.get("user_algo_path") else 0) + len(session["challengers"])
+    config, budget_note = _apply_runtime_budget(
+        base_config,
+        request.execution_mode,
+        expected_algorithms=max(1, expected_algorithms),
+    )
+    if budget_note:
+        await ws_manager.broadcast(session_id, {
+            "type": "log",
+            "source": "System",
+            "message": budget_note,
+        })
+    
+    # 1. Implementation Phase (Parallel)
+    # For each PDF challenger, we need to generate code
+    
+    # 2. Register Algorithms
+    if request.execution_mode == "modal":
+        runner = ModalRunner(
+            config,
             modal_token_id=request.modal_token_id,
-            modal_token_secret=request.modal_token_secret,
+            modal_token_secret=request.modal_token_secret
+        )
+    else:
+        runner = BenchmarkRunner(config)
+    
+    # Attach WebSocket Logger to the runner
+    runner_logger = logging.getLogger("benchwarmer.engine.runner")
+    modal_runner_logger = logging.getLogger("benchwarmer.engine.modal_runner")
+    ws_handler = WebSocketLogHandler(session_id, ws_manager, asyncio.get_running_loop())
+    ws_handler.setLevel(logging.INFO)
+    runner_logger.addHandler(ws_handler)
+    modal_runner_logger.addHandler(ws_handler)
+    
+    # User Algo
+    if session["user_algo_path"]:
+        from benchwarmer.utils.algorithm_sandbox import execute_algorithm_code
+        try:
+            with open(session["user_algo_path"], 'r') as f:
+                code = f.read()
+            res = execute_algorithm_code(code, config.problem_class)
+            if res["success"]:
+                runner.register_algorithm(res["algorithm"])
+                await ws_manager.broadcast(session_id, {
+                    "type": "log",
+                    "source": "System",
+                    "message": f"Loaded user algorithm: {res['name']}"
+                })
+            else:
+                await ws_manager.broadcast(session_id, {
+                    "type": "error",
+                    "message": f"Failed to load user algo: {res.get('error')} {res.get('traceback', '')}"
+                })
+        except Exception as e:
+            await ws_manager.broadcast(session_id, {
+                "type": "error",
+                "message": f"Failed to load user algo: {e}"
+            })
+            
+    # Challengers: baselines first (cheap), then PDF implementations in parallel.
+    pdf_challengers: list[dict[str, Any]] = []
+    for c in session["challengers"]:
+        if c["type"] == "baseline":
+            # Add baseline
+            if config.problem_class == "minimum_vertex_cover":
+                runner.register_algorithm(GreedyVertexCover())
+            else:
+                 runner.register_algorithm(RandomMaxCut())
+            await ws_manager.broadcast(session_id, {
+                "type": "log", 
+                "source": "System",
+                "message": f"Added baseline: {c['name']}"
+            })
+            
+        elif c["type"] == "pdf":
+            pdf_challengers.append(c)
+
+    async def implement_pdf_challenger(challenger: dict[str, Any]) -> None:
+        await ws_manager.broadcast(session_id, {
+            "type": "challenger_update",
+            "challenger_id": challenger["id"],
+            "status": "implementing",
+            "message": f"Generating implementation for {challenger['name']}...",
+        })
+        try:
+            impl_agent = ImplementationAgent()
+            loop = asyncio.get_event_loop()
+            nemotron_context = challenger.get("ingestion_context")
+            result = await loop.run_in_executor(
+                None,
+                lambda: impl_agent.generate(
+                    description=(
+                        "Implement the algorithm described in the provided paper. "
+                        "Use the ingestion summary as the primary guide."
+                    ),
+                    problem_class=config.problem_class,
+                    additional_context=nemotron_context,
+                    pdf_paths=[challenger["path"]],
+                    max_retries=2,
+                ),
+            )
+
+            if result["success"]:
+                challenger["implementation"] = result["algorithm"]
+                runner.register_algorithm(challenger["implementation"])
+                await ws_manager.broadcast(session_id, {
+                    "type": "challenger_update",
+                    "challenger_id": challenger["id"],
+                    "status": "testing",
+                    "message": "Running smoke validation on generated implementation...",
+                })
+                smoke_result = result.get("smoke_result", {})
+                if smoke_result:
+                    await ws_manager.broadcast(session_id, {
+                        "type": "log",
+                        "source": "ImplementationAgent",
+                        "challenger_id": challenger["id"],
+                        "message": f"Smoke test result: {json.dumps(smoke_result)}",
+                    })
+                await ws_manager.broadcast(session_id, {
+                    "type": "challenger_update",
+                    "challenger_id": challenger["id"],
+                    "status": "ready",
+                    "message": f"Implementation successful: {result['name']}",
+                })
+                await _broadcast_code_preview(
+                    session_id=session_id,
+                    challenger_id=challenger["id"],
+                    challenger_name=challenger["name"],
+                    code=result.get("code", ""),
+                )
+            else:
+                await ws_manager.broadcast(session_id, {
+                    "type": "challenger_error",
+                    "challenger_id": challenger["id"],
+                    "message": f"Generation failed: {result['error']}",
+                })
+        except Exception as e:
+            logging.error("Implementation failed for %s: %s", challenger.get("name"), e, exc_info=True)
+            await ws_manager.broadcast(session_id, {
+                "type": "challenger_error",
+                "challenger_id": challenger["id"],
+                "message": f"Agent error: {str(e)}",
+            })
+
+    if pdf_challengers:
+        await asyncio.gather(
+            *(implement_pdf_challenger(c) for c in pdf_challengers),
+            return_exceptions=True,
         )
 
-        return transform_results(df)
+    # 3. Run Benchmark (Custom Loop to stream events)
+    # We need to monkey-patch or subclass Runner to emit events?
+    # Or just iterate manually.
+    
+    await ws_manager.broadcast(session_id, {"type": "status", "status": "benchmarking"})
+    
+    # ... execution logic ...
+    # For v0, let's just run it synchronously and emit the final result
+    # We will refine 'live' streaming in the next iteration.
+    
+    try:
+        if request.execution_mode == "modal":
+            # ModalRunner is Async
+            df = await runner.run()
+        else:
+            # BenchmarkRunner is Sync
+            loop = asyncio.get_event_loop()
+            df = await loop.run_in_executor(None, runner.run)
+    finally:
+        # Cleanup logger
+        runner_logger.removeHandler(ws_handler)
+        modal_runner_logger.removeHandler(ws_handler)
+    
+    await ws_manager.broadcast(session_id, {"type": "status", "status": "aggregating"})
 
-    except Exception as e:
-        logging.error(f"Error running benchmark: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+    # Surface per-algorithm failures without failing entire run.
+    try:
+        error_rows = df[df["status"] != "success"]
+        if not error_rows.empty:
+            grouped = (
+                error_rows.groupby(["algorithm_name", "status"])
+                .size()
+                .reset_index(name="count")
+            )
+            for _, row in grouped.iterrows():
+                await ws_manager.broadcast(session_id, {
+                    "type": "log",
+                    "source": "Runner",
+                    "message": (
+                        f"Algorithm '{row['algorithm_name']}' had {int(row['count'])} "
+                        f"{row['status']} run(s)"
+                    ),
+                })
+    except Exception:
+        logging.exception("Failed to summarize algorithm errors for websocket output")
 
+    # Transform and send results (or explicit error status).
+    try:
+        response = transform_results(df, config.problem_class)
+        await ws_manager.broadcast(session_id, {
+            "type": "result",
+            "data": response.model_dump()
+        })
+        await ws_manager.broadcast(session_id, {"type": "status", "status": "completed"})
+    except HTTPException as e:
+        await ws_manager.broadcast(session_id, {
+            "type": "error",
+            "message": e.detail if hasattr(e, "detail") else str(e),
+        })
+        await ws_manager.broadcast(session_id, {"type": "status", "status": "error"})
+
+
+@app.websocket("/api/session/{session_id}/live")
+async def websocket_endpoint(websocket: WebSocket, session_id: str):
+    """WebSocket for live terminal streaming"""
+    await ws_manager.connect(websocket, session_id)
+    await ws_manager.broadcast(session_id, {"type": "status", "status": "connected"})
+    try:
+        while True:
+            # Keep connection alive, maybe receive commands (like "stop")
+            data = await websocket.receive_text()
+            # process client commands if any
+    except WebSocketDisconnect:
+        ws_manager.disconnect(websocket, session_id)
 
 if __name__ == "__main__":
     import uvicorn

@@ -12,8 +12,10 @@ import json
 import logging
 import os
 import sys
+import asyncio
 from dataclasses import asdict, dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Optional
+import pandas as pd
 
 from benchwarmer.utils.loader import load_algorithm_from_file
 
@@ -36,15 +38,6 @@ class PipelineState:
     custom_algo_path: str | None = None
     custom_algo_name: str | None = None
     instance_source: str | None = None  # "generator" | "custom" | "suite" | None
-    # Plot path from latest analyze_results call (consumed by server after each turn)
-    last_plot_path: str | None = None
-    # Preferences extracted from the user's initial message (so we don't ask again)
-    preferred_runs_per_instance: int | None = None
-    preferred_algo_spec_indices: list[int] | None = None  # e.g. [0, 2]
-    preferred_plot_requests: list[str] | None = None  # NL descriptions to plot after benchmark
-    preferred_instance_source: str | None = None  # "generator" | "custom" | "suite" | None
-    preferred_suite_key: str | None = None  # e.g. "biqmac", "dimacs"
-    preferred_instance_names: list[str] | None = None  # e.g. ["g05_60.0", "g05_80.0"]
 
     def summary(self) -> str:
         """Human-readable summary for the LLM system prompt."""
@@ -56,7 +49,7 @@ class PipelineState:
             if self.instance_source:
                 lines.append(f"Instance source: {self.instance_source}")
             else:
-                lines.append("Instance source: NOT CHOSEN — YOU MUST ASK: 'Use generators, custom JSON file, or benchmark suite?' Do NOT call use_generators until user chooses.")
+                lines.append("Instance source: NOT CHOSEN (ask user: generator, custom JSON, or benchmark suite)")
 
             gens = c.instance_config.generators
             if gens:
@@ -71,27 +64,9 @@ class PipelineState:
         else:
             lines.append("Config: NOT SET (run intake first)")
 
-        if self.preferred_runs_per_instance is not None:
-            lines.append(f"User requested runs per instance: {self.preferred_runs_per_instance} (already applied)")
-        if self.preferred_plot_requests:
-            lines.append(f"User requested plots (generate after benchmark): {', '.join(self.preferred_plot_requests)}")
-        if self.preferred_instance_source and not self.instance_source:
-            src = self.preferred_instance_source
-            msg = f"User requested instance source: {src}"
-            if src == "suite" and self.preferred_suite_key:
-                msg += f" (suite: {self.preferred_suite_key})"
-                if self.preferred_instance_names:
-                    msg += f" with instances: {', '.join(self.preferred_instance_names)}"
-            msg += " — apply this automatically using the appropriate tool WITHOUT asking."
-            lines.append(msg)
-
         if self.algo_specs:
-            specs = [f"{i}. {s.name} ({s.source})" for i, s in enumerate(self.algo_specs)]
+            specs = [f"{s.name} ({s.source})" for s in self.algo_specs]
             lines.append(f"Paper algorithms (extracted, not yet coded): {', '.join(specs)}")
-            if self.preferred_algo_spec_indices is not None:
-                lines.append(f"User requested algorithms (by index): {self.preferred_algo_spec_indices} — call code_algorithm with these indices without asking.")
-            elif not self.algorithms or len(self.algorithms) <= (1 if self.custom_algo_name else 0):
-                lines.append("ACTION REQUIRED: Ask user 'Which of these do you want me to implement? (Reply by index, e.g. 0, 1, or 0 2, or all)' BEFORE asking about instance source.")
 
         if self.algorithms:
             algo_names = [a.name for a in self.algorithms]
@@ -115,13 +90,13 @@ class PipelineState:
 ORCHESTRATOR_TOOLS = [
     {
         "name": "run_intake",
-        "description": "Run the IntakeAgent to analyze the user's problem description (and optional PDFs) to produce a BenchmarkConfig and extract algorithm specs. Pass the full user message as description — it may also include runs per instance, which algorithms to implement, and which plots they want; these are extracted and carried forward so you do not ask later.",
+        "description": "Run the IntakeAgent to analyze the user's problem description (and optional PDFs) to produce a BenchmarkConfig and extract algorithm specs from papers. Call this first to set up the benchmark.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "description": {
                     "type": "string",
-                    "description": "The user's full message (problem description and optionally: runs/trials per instance, which paper algorithms to implement, what plots they want).",
+                    "description": "The user's natural-language problem description (e.g. 'max cut', 'vertex cover on sparse graphs').",
                 },
             },
             "required": ["description"],
@@ -168,14 +143,14 @@ ORCHESTRATOR_TOOLS = [
     },
     {
         "name": "code_algorithm",
-        "description": "Generate and register code for paper-extracted algorithm(s). Call ONLY after the user has told you which algorithm(s) to implement (by index). Do not call before asking the user which of the listed paper algorithms they want.",
+        "description": "Use the ImplementationAgent to generate code for an algorithm. Can ONLY be called with an index referencing a paper algorithm spec.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "spec_indices": {
                     "type": "array",
                     "items": {"type": "integer"},
-                    "description": "0-based indices into algo_specs (e.g. [0, 2] for first and third).",
+                    "description": "0-based indices into algo_specs to code from paper extractions.",
                 },
             },
             "required": ["spec_indices"],
@@ -216,13 +191,13 @@ ORCHESTRATOR_TOOLS = [
     },
     {
         "name": "analyze_results",
-        "description": "Generate a visualization or analysis of benchmark results. Call ONLY when the user explicitly asks for a plot, chart, or analysis (e.g. 'plot a bar chart', 'show me runtime comparison'). Do NOT call automatically after run_benchmark — wait for the user to request a visualization.",
+        "description": "Generate a visualization or analysis of benchmark results using the PlotAgent. Requires benchmark to have been run.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "request": {
                     "type": "string",
-                    "description": "The user's visualization/analysis request (e.g. 'bar chart comparing algorithms'). Use what the user asked for, not a default.",
+                    "description": "The visualization/analysis request (e.g. 'bar chart comparing algorithms').",
                 },
             },
             "required": ["request"],
@@ -274,7 +249,7 @@ ORCHESTRATOR_TOOLS = [
     },
     {
         "name": "use_generators",
-        "description": "Set instance source to generators. ONLY call this when the user has explicitly said they want to use the proposed generators. Do NOT call by default after intake — ask the user first to choose: generators, custom file, or suite.",
+        "description": "Confirm using the proposed generators as the instance source (this is set after intake). Call this when the user chooses generators.",
         "input_schema": {
             "type": "object",
             "properties": {},
@@ -282,7 +257,7 @@ ORCHESTRATOR_TOOLS = [
     },
     {
         "name": "load_custom_instances",
-        "description": "Set instance source to custom and load graph instances from a JSON file. Call when the user wants to provide their own instance file (not the default).",
+        "description": "Load custom graph instances from a JSON file. Use when user wants to provide their own instances.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -296,7 +271,7 @@ ORCHESTRATOR_TOOLS = [
     },
     {
         "name": "load_suite",
-        "description": "Set instance source to suite and load instances from a benchmark suite (DIMACS, Biq Mac, SNAP). First call with suite_key and empty instance_names to list instances; then WAIT for the user to say which instances they want (by name). Only call again with instance_names when the user has specified which to load — do NOT pass all instance names unless the user explicitly asked for all.",
+        "description": "Browse and load instances from a benchmark suite (DIMACS, Biq Mac, SNAP). Use when user wants standard benchmark instances.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -306,12 +281,12 @@ ORCHESTRATOR_TOOLS = [
                 },
                 "suite_key": {
                     "type": "string",
-                    "description": "Key of the suite to browse (e.g. biqmac).",
+                    "description": "Key of the suite to browse (returned by list_suites).",
                 },
                 "instance_names": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Instance names to load. Leave empty or omit to only list instances. Only fill with names AFTER the user has told you which ones they want (e.g. g05_60.0, g05_80.0). Never pass the full list unless the user said 'all' or 'load all'.",
+                    "description": "Specific instance names to fetch from the suite. If empty, lists available instances.",
                 },
             },
         },
@@ -332,25 +307,24 @@ You manage the benchmarking pipeline conversationally. The user talks to you in 
 natural language and you use your tools to take actions. You should be helpful, \
 concise, and proactive.
 
-## Pipeline Steps (order matters after intake)
-1. **Intake**: Analyze the problem description (+ optional PDFs) → BenchmarkConfig + AlgorithmSpecs. The user may also specify in the same message: runs per instance, which algorithms to implement, which instances/suite to use, and which plots they want — these are ALL carried forward so you do not ask again.
-2. **Which algorithms to implement**: If state shows "User requested algorithms (by index)", call code_algorithm with those indices immediately — do NOT ask. If paper algorithms exist AND the user uploaded PDFs, implement ALL paper algorithm after asking, and confirming— call code_algorithm with all indicec. If more than 1 algorithm is present, always prompt the user to confirm which algorithms to run.
-3. **Instance source** (REQUIRED before benchmark): If state shows "User requested instance source", apply it immediately using the appropriate tool (use_generators, load_suite, load_custom_instances) WITHOUT asking. For suites: if suite_key is specified, call load_suite with that key; if instance_names are also specified, call load_suite with those names directly; otherwise list instances and let user pick. If no preference, the user MUST choose one: generator, custom, or suite (see tools).
-4. **Configure**: Modify generators/instances, execution settings
-5. **Benchmark**: Run the benchmark → you receive a **summary table** with avg runtime, avg memory, success rate per algorithm. Present this table to the user verbatim (keep the markdown table format). No charts are generated at this stage.
-6. **Analysis**: After presenting the benchmark summary table, ask: "Would you like any plots or visualizations of these results?" Only call analyze_results when the user explicitly says yes or requests specific plots. If state shows "User requested plots (generate after benchmark)", call analyze_results for EACH requested plot after asking the user, then ask if they want more.
+## Pipeline Steps (flexible order)
+1. **Intake**: Analyze the problem description (+ optional PDFs) → BenchmarkConfig + AlgorithmSpecs
+2. **Instance source**: Ask the user how they want to provide instances:
+   - **generator** — use the AI-proposed generators (can modify params/sizes)
+   - **custom** — load instances from a JSON file
+   - **suite** — pull from benchmark suites (DIMACS, Biq Mac, SNAP)
+3. **Configure**: Modify generators/instances, execution settings (runs, timeout)
+4. **Algorithms**: Code extracted algorithms from papers
+5. **Benchmark**: Run the benchmark
+6. **Analysis**: Visualize and analyze results
 
 ## Key Behaviors
-- **Short replies like "0", "1", "0 2", "all", "generators", "yes", "run" are ANSWERS to your previous question.** Interpret them in context of what you last asked. For example, if you asked "Which algorithms do you want me to implement?" and the user replies "0", that means "implement algorithm at index 0" — call code_algorithm with spec_indices=[0]. If you asked about instance source and the user replies "generators", call use_generators. NEVER ask for clarification when the user gives a clear index or keyword.
-- When "User requested algorithms (by index)" is in state, call code_algorithm with that list without asking. When "User requested plots" is in state, after run_benchmark call analyze_results for each listed request, then ask if they want more.
-- When "User requested instance source" is in state, act on it immediately without asking: call use_generators, load_suite (with suite_key and optionally instance_names), or load_custom_instances as appropriate. Do NOT ask the user to confirm — they already specified this.
-- When "Instance source: NOT CHOSEN" appears in state AND no instance preference exists, ask the user to choose: generator, custom JSON file, or benchmark suite. Do NOT call use_generators until the user explicitly chooses generators.
-- When using load_suite: after you list instances (first call with empty instance_names), you MUST wait for the user to tell you which instance names to load. Do NOT call load_suite again with all names — only pass the instance_names the user asked for. If the user says "all" or "load all", then you may pass the full list. Exception: if state has preferred_instance_names, load those directly.
-- Do NOT call analyze_results unless the user explicitly asks for a plot/chart/visualization. Exception: if state lists "User requested plots", ask the user to confirm, then call analyze_results for each.
-- After run_benchmark, you get a markdown summary table. Present it to the user EXACTLY (keep the | table format). Then ask "Would you like any plots or visualizations?" Do NOT generate plots automatically.
+- After intake, ALWAYS ask the user how they want to provide instances (generator/custom/suite) \
+unless they already specified
 - The user can go back to any step at any time
 - If the user says "go back", "undo", "restart", or "change X", use the appropriate tool
 - If the user describes a problem, run intake automatically
+- If paper algorithms were extracted, list them and ask which to code
 - Always be concise — don't repeat information the user already knows
 - If unsure what the user wants, ask a brief clarifying question
 - When showing status, be brief — just key facts
@@ -358,127 +332,6 @@ concise, and proactive.
 ## Current Pipeline State
 {state_summary}
 """
-
-
-# ──────────────────────────────────────────────────────────────
-# User preference extraction (from initial message)
-# ──────────────────────────────────────────────────────────────
-
-def _extract_user_preferences(backend: Any, user_message: str, algo_specs: list) -> dict[str, Any]:
-    """
-    Extract runs_per_instance, algo_indices, plot_requests, instance_source,
-    suite_key, and instance_names from the user's message so we can carry them
-    forward without asking again.
-    """
-    if not user_message.strip():
-        return {
-            "runs_per_instance": None, "algo_indices": None, "plot_requests": None,
-            "instance_source": None, "suite_key": None, "instance_names": None,
-        }
-
-    algo_list = "\n".join(f"  [{i}] {s.name}" for i, s in enumerate(algo_specs)) if algo_specs else "(none)"
-
-    # Get available suite keys for the LLM to match against
-    try:
-        from benchwarmer.utils.benchmark_suites import list_suites
-        suites = list_suites()
-        suite_info = "\n".join(f"  - {s['key']}: {s['name']} ({s['instance_count']} instances)" for s in suites)
-    except Exception:
-        suite_info = "(none available)"
-
-    system = """You extract structured preferences from the user's message. Reply with ONLY a single JSON object, no markdown, no explanation.
-Use these exact keys:
-- "runs_per_instance": integer or null (e.g. 5, 10 if they said "5 runs", "10 trials per instance")
-- "algo_indices": list of 0-based integers or null (which paper algorithms to implement; if they say "all" return all valid indices as a list; if they name algorithms match by name to index; if not mentioned use null)
-- "plot_requests": list of strings or null (each string is a natural-language plot/visualization request, e.g. "bar chart of runtimes", "scatter objective vs size")
-- "instance_source": one of "generator", "suite", "custom" or null. "generator" if they mention generators/generate instances; "suite" if they mention benchmark suite, biqmac, dimacs, or any known suite name; "custom" if they mention custom JSON/file.
-- "suite_key": string or null — the suite key if they mentioned a specific suite (match against available suites below). e.g. "biqmac", "dimacs".
-- "instance_names": list of strings or null — specific instance names if mentioned (e.g. ["g05_60.0", "g05_80.0"]).
-If something is not mentioned, use null for that key."""
-
-    user_content = f"""User message:
-{user_message}
-
-Paper algorithms (by index):
-{algo_list}
-
-Available benchmark suites:
-{suite_info}
-
-Extract all preferences. Output only the JSON object."""
-
-    try:
-        response = backend.generate(
-            messages=[{"role": "user", "content": user_content}],
-            system=system,
-            tools=None,
-            max_tokens=512,
-        )
-        text = ""
-        for block in response.content:
-            if hasattr(block, "text"):
-                text += block.text
-        text = text.strip()
-        # Strip markdown code block if present
-        if "```" in text:
-            for marker in ("```json", "```"):
-                if marker in text:
-                    start = text.index(marker) + len(marker)
-                    end = text.find("```", start)
-                    text = text[start:(end if end != -1 else None)].strip()
-                    break
-        data = json.loads(text)
-
-        # -- runs_per_instance --
-        runs = data.get("runs_per_instance")
-        if runs is not None and not isinstance(runs, int):
-            runs = int(runs) if isinstance(runs, (float, str)) and str(runs).isdigit() else None
-
-        # -- algo_indices --
-        indices = data.get("algo_indices")
-        if indices is not None and not isinstance(indices, list):
-            indices = None
-        if indices is not None:
-            indices = [int(i) for i in indices if isinstance(i, (int, float)) or (isinstance(i, str) and i.isdigit())]
-
-        # -- plot_requests --
-        plots = data.get("plot_requests")
-        if plots is not None and not isinstance(plots, list):
-            plots = [str(plots)] if plots else None
-        if plots is not None:
-            plots = [str(p).strip() for p in plots if p]
-
-        # -- instance_source --
-        inst_src = data.get("instance_source")
-        if inst_src not in ("generator", "suite", "custom"):
-            inst_src = None
-
-        # -- suite_key --
-        suite_key = data.get("suite_key")
-        if suite_key is not None and not isinstance(suite_key, str):
-            suite_key = None
-
-        # -- instance_names --
-        inst_names = data.get("instance_names")
-        if inst_names is not None and not isinstance(inst_names, list):
-            inst_names = None
-        if inst_names is not None:
-            inst_names = [str(n).strip() for n in inst_names if n]
-
-        return {
-            "runs_per_instance": runs,
-            "algo_indices": indices if indices else None,
-            "plot_requests": plots or None,
-            "instance_source": inst_src,
-            "suite_key": suite_key if inst_src == "suite" else None,
-            "instance_names": inst_names or None,
-        }
-    except Exception as e:
-        logger.warning("Could not extract user preferences: %s", e)
-        return {
-            "runs_per_instance": None, "algo_indices": None, "plot_requests": None,
-            "instance_source": None, "suite_key": None, "instance_names": None,
-        }
 
 
 # ──────────────────────────────────────────────────────────────
@@ -491,7 +344,7 @@ class OrchestratorAgent:
     def __init__(
         self,
         execution_mode: str = "local",
-        intake_backend: str = "claude",
+        intake_backend: str = "nemotron",
         pdf_paths: list[str] | None = None,
         custom_algo_path: str | None = None,
         nemotron_url: str | None = None,
@@ -499,11 +352,19 @@ class OrchestratorAgent:
     ):
         from benchwarmer.agents.backends import ClaudeBackend, OpenAIBackend
 
-        # Same LLM backend for both orchestrator and intake (claude or nemotron)
-        if intake_backend == "nemotron":
+        resolved_intake_backend = (intake_backend or "nemotron").lower()
+        if resolved_intake_backend == "nemotron":
             self.backend = OpenAIBackend(
-                base_url=nemotron_url or "https://integrate.api.nvidia.com/v1",
-                model=nemotron_model or "nvidia/nemotron-3-nano-30b-a3b",
+                base_url=nemotron_url or os.environ.get("NEMOTRON_BASE_URL", "http://10.19.177.52:11434/api"),
+                model=nemotron_model or os.environ.get(
+                    "NEMOTRON_MODEL",
+                    "hf.co/unsloth/Nemotron-3-Nano-30B-A3B-GGUF:Q4_K_M",
+                ),
+                api_key=(
+                    os.environ.get("NEMOTRON_API_KEY")
+                    or os.environ.get("NVIDIA_API_KEY")
+                    or os.environ.get("OPENAI_API_KEY")
+                ),
             )
         else:
             self.backend = ClaudeBackend()
@@ -512,13 +373,12 @@ class OrchestratorAgent:
             pdf_paths=pdf_paths or [],
             custom_algo_path=custom_algo_path,
         )
-        self.intake_backend_name = intake_backend
+        self.intake_backend_name = resolved_intake_backend
         self.nemotron_url = nemotron_url
         self.nemotron_model = nemotron_model
         self.plot_index = 0
         self._plot_agent = None
         self._impl_agent = None
-        self._progress_cb = None
 
         # Load custom algorithm if provided
         if self.state.custom_algo_path:
@@ -534,100 +394,7 @@ class OrchestratorAgent:
                 print(f"❌ Custom algorithm file not found: {self.state.custom_algo_path}")
 
     # ------------------------------------------------------------------
-    # One-turn API (for web frontend multi-turn chat)
-    # ------------------------------------------------------------------
-
-    def run_one_turn(
-        self,
-        messages: list[dict[str, Any]],
-        user_message: str,
-        max_tool_turns: int = 15,
-        progress_cb: Callable[[dict], None] | None = None,
-    ) -> tuple[list[dict[str, Any]], str]:
-        """
-        Append *user_message*, run LLM tool loop until final text reply.
-        Returns ``(updated_messages, assistant_reply_text)``.
-
-        If *progress_cb* is provided it is called with event dicts:
-            {"type": "thinking"}
-            {"type": "tool_start", "tool": <name>, "input": <dict>}
-            {"type": "tool_end",   "tool": <name>, "result": <str>}
-        """
-        messages.append({"role": "user", "content": user_message})
-
-        # Store progress_cb so tool handlers (like _tool_run_benchmark) can emit events
-        self._progress_cb = progress_cb
-
-        system = ORCHESTRATOR_SYSTEM_PROMPT.format(
-            state_summary=self.state.summary(),
-        )
-        reply_text = ""
-
-        # Nemotron's <think> blocks consume a lot of the token budget,
-        # so give non-Claude backends more room.
-        from benchwarmer.agents.backends import ClaudeBackend as _CB
-        _max_tokens = 4096 if isinstance(self.backend, _CB) else 8192
-
-        for _ in range(max_tool_turns):
-            if progress_cb:
-                progress_cb({"type": "thinking"})
-
-            try:
-                response = self.backend.generate(
-                    messages=messages,
-                    system=system,
-                    tools=ORCHESTRATOR_TOOLS,
-                    max_tokens=_max_tokens,
-                )
-            except Exception as e:
-                logger.exception("LLM generate error: %s", e)
-                reply_text = f"Error: {e}"
-                break
-
-            if response.stop_reason == "tool_use":
-                assistant_content = [asdict(b) for b in response.content]
-                messages.append({"role": "assistant", "content": assistant_content})
-
-                tool_results = []
-                for block in response.content:
-                    if block.type == "tool_use":
-                        logger.info("Tool call: %s", block.name)
-                        if progress_cb:
-                            progress_cb({"type": "tool_start", "tool": block.name, "input": block.input})
-                        result_str = self._dispatch_tool(block.name, block.input)
-                        if progress_cb:
-                            progress_cb({"type": "tool_end", "tool": block.name, "result": result_str[:1500]})
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": result_str,
-                        })
-                messages.append({"role": "user", "content": tool_results})
-
-                # Refresh system prompt (state may have changed)
-                system = ORCHESTRATOR_SYSTEM_PROMPT.format(
-                    state_summary=self.state.summary(),
-                )
-                continue
-
-            # Final text reply (also accept max_tokens — use whatever was generated)
-            if response.stop_reason in ("end_turn", "stop", "max_tokens"):
-                if response.stop_reason == "max_tokens":
-                    logger.warning("Orchestrator response hit max_tokens — using partial output")
-                for block in response.content:
-                    if hasattr(block, "text"):
-                        reply_text += block.text
-                serialized = [asdict(b) for b in response.content]
-                messages.append({"role": "assistant", "content": serialized})
-                break
-
-            logger.warning("Unexpected stop_reason: %s", response.stop_reason)
-            break
-
-        return messages, reply_text.strip()
-
-    # ------------------------------------------------------------------
-    # Main loop (CLI)
+    # Main loop
     # ------------------------------------------------------------------
 
     def run(self) -> None:
@@ -642,10 +409,6 @@ class OrchestratorAgent:
         print("Type 'exit' or 'quit' to stop.\n")
 
         messages: list[dict[str, Any]] = []
-
-        # Nemotron's <think> blocks consume a lot of the token budget
-        from benchwarmer.agents.backends import ClaudeBackend as _CB
-        _max_tokens = 4096 if isinstance(self.backend, _CB) else 8192
 
         # If PDF paths were provided via CLI, mention them in the initial context
         if self.state.pdf_paths:
@@ -693,7 +456,7 @@ class OrchestratorAgent:
                         messages=messages,
                         system=system,
                         tools=ORCHESTRATOR_TOOLS,
-                        max_tokens=_max_tokens,
+                        max_tokens=4096,
                     )
                 except Exception as e:
                     print(f"\n❌ LLM error: {e}\n")
@@ -722,10 +485,8 @@ class OrchestratorAgent:
                     messages.append({"role": "user", "content": tool_results})
                     continue
 
-                # Handle text response (also accept max_tokens)
-                if response.stop_reason in ("end_turn", "stop", "max_tokens"):
-                    if response.stop_reason == "max_tokens":
-                        logger.warning("CLI orchestrator response hit max_tokens — using partial output")
+                # Handle text response
+                if response.stop_reason in ("end_turn", "stop"):
                     text = ""
                     for block in response.content:
                         if hasattr(block, "text"):
@@ -776,72 +537,174 @@ class OrchestratorAgent:
     # Tool Handlers
     # ------------------------------------------------------------------
 
+    def _build_fallback_intake_config(self, user_description: str):
+        """
+        Deterministic no-LLM fallback when Nemotron/Claude is unavailable.
+        """
+        from benchwarmer.agents.tools import classify_problem, get_generators_for_class
+        from benchwarmer.config import (
+            BenchmarkConfig,
+            ExecutionConfig,
+            GeneratorConfig,
+            InstanceConfig,
+        )
+
+        ranked = classify_problem(user_description)
+        top = ranked[0] if ranked else {
+            "name": "maximum_cut",
+            "objective": "maximize",
+        }
+        problem_class = top.get("name", "maximum_cut")
+        objective = top.get("objective", "maximize")
+
+        try:
+            available_generators = get_generators_for_class(problem_class)
+        except Exception:
+            available_generators = ["erdos_renyi"]
+
+        generators: list[GeneratorConfig] = []
+        if "erdos_renyi" in available_generators:
+            generators.append(
+                GeneratorConfig(
+                    type="erdos_renyi",
+                    params={"p": 0.3},
+                    sizes=[50, 100, 200],
+                    count_per_size=2,
+                    why="Deterministic fallback when LLM backend is unavailable.",
+                )
+            )
+        elif available_generators:
+            generators.append(
+                GeneratorConfig(
+                    type=available_generators[0],
+                    params={},
+                    sizes=[50, 100, 200],
+                    count_per_size=2,
+                    why="Deterministic fallback when LLM backend is unavailable.",
+                )
+            )
+        else:
+            generators.append(
+                GeneratorConfig(
+                    type="erdos_renyi",
+                    params={"p": 0.3},
+                    sizes=[50, 100, 200],
+                    count_per_size=2,
+                    why="Fallback default generator.",
+                )
+            )
+
+        return BenchmarkConfig(
+            problem_class=problem_class,
+            problem_description=f"Fallback config for: {user_description[:200]}",
+            objective=objective,
+            instance_config=InstanceConfig(generators=generators),
+            execution_config=ExecutionConfig(
+                timeout_seconds=45,
+                runs_per_config=3,
+                memory_limit_mb=2048,
+            ),
+        )
+
+    def _run_intake_via_backend(self, user_description: str) -> Any:
+        """
+        Backend-agnostic intake loop using deterministic intake tools.
+        This supports Nemotron/OpenAI-compatible endpoints without requiring
+        Anthropic-specific IntakeAgent wiring.
+        """
+        from benchwarmer.agents.intake import SYSTEM_PROMPT, IntakeAgent
+        from benchwarmer.agents.tools import TOOL_DEFINITIONS, dispatch_tool_call
+
+        messages: list[dict[str, Any]] = [{"role": "user", "content": user_description}]
+        max_turns = 10
+
+        for _ in range(max_turns):
+            response = self.backend.generate(
+                messages=messages,
+                system=SYSTEM_PROMPT,
+                tools=TOOL_DEFINITIONS,
+                max_tokens=4096,
+            )
+
+            if response.stop_reason == "tool_use":
+                assistant_content = [asdict(b) for b in response.content]
+                messages.append({"role": "assistant", "content": assistant_content})
+
+                tool_results = []
+                for block in response.content:
+                    if getattr(block, "type", None) == "tool_use":
+                        result_str = dispatch_tool_call(block.name, block.input)
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": result_str,
+                        })
+
+                messages.append({"role": "user", "content": tool_results})
+                continue
+
+            if response.stop_reason in ("end_turn", "stop", "max_tokens", None):
+                text = ""
+                for block in response.content:
+                    if hasattr(block, "text"):
+                        text += block.text
+
+                config = IntakeAgent._try_parse_config(text)
+                if config is not None:
+                    return config
+
+            break
+
+        raise RuntimeError("Intake backend did not produce a valid config.")
+
     def _tool_run_intake(self, data: dict) -> str:
         description = data.get("description", "")
         if not description:
             return "❌ No description provided."
 
-        from benchwarmer.agents.intake import IntakeAgent
-
-        # Use same backend as orchestrator (claude or nemotron)
-        agent = IntakeAgent(backend=self.backend)
-
-        # Validate PDFs
-        pdf_paths = None
+        # If PDF paths were provided, include filenames in context for the intake model.
         if self.state.pdf_paths:
-            pdf_paths = [p for p in self.state.pdf_paths if os.path.exists(p)]
-            if pdf_paths:
-                names = [os.path.basename(p) for p in pdf_paths]
-                print(f"  📄 Analyzing papers: {', '.join(names)}")
+            existing = [p for p in self.state.pdf_paths if os.path.exists(p)]
+            if existing:
+                names = [os.path.basename(p) for p in existing]
+                description = (
+                    f"{description}\n\n"
+                    f"Related papers (filenames): {', '.join(names)}.\n"
+                    "Use this as additional context for problem framing."
+                )
 
-        result = agent.run(description, pdf_paths=pdf_paths, interactive=False)
-        self.state.config = result.config
-        self.state.algo_specs = result.algorithms
+        used_fallback = False
+        fallback_error = ""
+        try:
+            config = self._run_intake_via_backend(description)
+        except Exception as e:
+            used_fallback = True
+            fallback_error = str(e)
+            logger.warning(
+                "Intake backend failed (%s). Using deterministic fallback config.",
+                e,
+            )
+            config = self._build_fallback_intake_config(description)
+
+        self.state.config = config
+        self.state.algo_specs = []
         self.state.instance_source = None  # Reset — user must choose
 
-        # Extract preferences from the same user message so we don't ask later
-        prefs = _extract_user_preferences(self.backend, description, self.state.algo_specs)
-        self.state.preferred_runs_per_instance = prefs.get("runs_per_instance")
-        self.state.preferred_algo_spec_indices = prefs.get("algo_indices")
-        self.state.preferred_plot_requests = prefs.get("plot_requests")
-        self.state.preferred_instance_source = prefs.get("instance_source")
-        self.state.preferred_suite_key = prefs.get("suite_key")
-        self.state.preferred_instance_names = prefs.get("instance_names")
-        if self.state.preferred_runs_per_instance is not None:
-            self.state.config.execution_config.runs_per_config = self.state.preferred_runs_per_instance
+        lines = [f"✅ IntakeAgent complete! Problem class: {config.problem_class}"]
+        lines.append(f"ℹ️ Intake backend: {self.intake_backend_name}")
+        if used_fallback:
+            lines.append(
+                f"⚠️ Nemotron backend unavailable; used deterministic fallback config ({fallback_error})."
+            )
 
-        lines = [f"✅ IntakeAgent complete! Problem class: {result.config.problem_class}"]
-
-        gens = result.config.instance_config.generators
+        gens = config.instance_config.generators
         if gens:
             lines.append(f"   Proposed generators: {', '.join(g.type for g in gens)}")
 
-        ec = result.config.execution_config
+        ec = config.execution_config
         lines.append(f"   Runs: {ec.runs_per_config}, Timeout: {ec.timeout_seconds}s")
 
-        if self.state.preferred_runs_per_instance is not None:
-            lines.append(f"   (Using {self.state.preferred_runs_per_instance} runs per instance from your message)")
-        if self.state.preferred_algo_spec_indices is not None:
-            names = [self.state.algo_specs[i].name for i in self.state.preferred_algo_spec_indices if 0 <= i < len(self.state.algo_specs)]
-            lines.append(f"   Will implement: {', '.join(names)} (from your message)")
-        if self.state.preferred_plot_requests:
-            lines.append(f"   Will generate these plots after benchmark: {', '.join(self.state.preferred_plot_requests)}")
-        if self.state.preferred_instance_source:
-            src = self.state.preferred_instance_source
-            msg = f"   Will use instance source: {src}"
-            if src == "suite" and self.state.preferred_suite_key:
-                msg += f" (suite: {self.state.preferred_suite_key})"
-                if self.state.preferred_instance_names:
-                    msg += f" → instances: {', '.join(self.state.preferred_instance_names)}"
-            lines.append(f"{msg} (from your message)")
-
-        if self.state.algo_specs:
-            lines.append(f"\n📋 Extracted {len(self.state.algo_specs)} algorithm(s) from papers:")
-            for i, spec in enumerate(self.state.algo_specs):
-                lines.append(f"   {i}. **{spec.name}**: {spec.approach} (source: {spec.source})")
-
-        if not self.state.instance_source and not self.state.preferred_instance_source:
-            lines.append("\nHow would you like to provide instances? (generator / custom JSON / benchmark suite)")
+        lines.append("\nHow would you like to provide instances? (generator / custom JSON / benchmark suite)")
 
         return "\n".join(lines)
 
@@ -931,15 +794,7 @@ class OrchestratorAgent:
                 )
                 if result["success"]:
                     self.state.algorithms.append(result["algorithm"])
-                    
-                    # Save to DB
-                    from benchwarmer.database import save_algorithm
-                    try:
-                        save_algorithm(result["name"], result["code"])
-                        results_msgs.append(f"✅ {result['name']} coded, tested, and saved to DB!")
-                    except Exception as e:
-                        results_msgs.append(f"✅ {result['name']} coded and tested, but failed to save to DB: {e}")
-
+                    results_msgs.append(f"✅ {result['name']} coded and tested!")
                 else:
                     results_msgs.append(f"❌ {spec.name} failed: {result['error']}")
 
@@ -974,123 +829,70 @@ class OrchestratorAgent:
     def _tool_run_benchmark(self, data: dict) -> str:
         if not self.state.config:
             return "❌ No config — run intake first."
-        if not self.state.instance_source:
-            return "❌ Instance source not chosen. Ask the user: use generators (use_generators), custom JSON file (load_custom_instances), or benchmark suite (load_suite)."
         if not self.state.algorithms:
             return "❌ No algorithms registered. Code or add baselines first."
 
         mode = data.get("execution_mode", self.state.execution_mode)
 
-        from benchwarmer.engine.runner import BenchmarkRunner
+        if mode == "modal":
+            from benchwarmer.engine.modal_runner import ModalRunner
+            runner = ModalRunner(self.state.config)
+        else:
+            from benchwarmer.engine.runner import BenchmarkRunner
+            runner = BenchmarkRunner(self.state.config)
 
-        runner = BenchmarkRunner(self.state.config)
         for algo in self.state.algorithms:
             runner.register_algorithm(algo)
 
-        # Modal pool
-        pool = self.state.pool
-        if mode == "modal" and pool is None:
-            from benchwarmer.engine.sandbox_pool import SandboxPool
-            pool = SandboxPool()
-            self.state.pool = pool
-
-        # Generate instances up front so we know the count before run()
-        if not runner._instances:
-            runner.generate_instances()
-
         algo_names = [a.name for a in self.state.algorithms]
-        total_inst = len(runner._instances)
+        total_inst = sum(
+            len(g.sizes) * g.count_per_size
+            for g in self.state.config.instance_config.generators
+        )
         runs = self.state.config.execution_config.runs_per_config
         print(f"  🚀 Running benchmark ({mode}): {len(algo_names)} algos × {total_inst} instances × {runs} runs")
 
-        # Emit sandbox visualization events only for modal (parallel) mode
-        _bench_progress = None
-        if mode == "modal":
-            runs_per_algo = total_inst * runs
-            if self._progress_cb:
-                self._progress_cb({
-                    "type": "benchmark_start",
-                    "algorithms": [
-                        {"name": a.name, "total_runs": runs_per_algo}
-                        for a in self.state.algorithms
-                    ],
-                })
-
-            def _bench_progress(algo_name, completed, total):
-                if self._progress_cb:
-                    self._progress_cb({
-                        "type": "benchmark_progress",
-                        "algorithm": algo_name,
-                        "completed": completed,
-                        "total": total,
-                    })
-
         try:
-            df = runner.run(execution_mode=mode, sandbox_pool=pool, progress_fn=_bench_progress)
+            if mode == "modal":
+                df = asyncio.run(runner.run())
+            else:
+                df = runner.run()
         except Exception as e:
             return f"❌ Benchmark failed: {e}"
-        finally:
-            if pool and mode == "modal":
-                try:
-                    pool.teardown_all_sync()
-                except Exception:
-                    pass
 
         self.state.results = df
-
-        # Emit benchmark_complete event (only if we started sandbox visualization)
-        if mode == "modal" and self._progress_cb:
-            self._progress_cb({"type": "benchmark_complete"})
-
-        # ── Build CLI-style summary table ──────────────────────────────
-        import pandas as _pd
-
-        success_df = df[df["status"] == "success"] if "status" in df.columns else df
-        total_rows = len(df)
-        success_rows = len(success_df)
-
-        lines = [f"✅ Benchmark complete! {total_rows} result rows ({success_rows} successful)."]
-
-        if not success_df.empty and "algorithm_name" in success_df.columns:
-            # Build per-algorithm stats
-            table_lines = []
-            table_lines.append("")
-            table_lines.append("| Algorithm | Avg Objective | Avg Runtime (s) | Avg Memory (MB) | Success Rate |")
-            table_lines.append("|-----------|--------------|-----------------|-----------------|--------------|")
-
+        
+        # Summarize results
+        stats = []
+        error_sample = None
+        if "algorithm_name" in df.columns and "status" in df.columns:
             for algo_name in df["algorithm_name"].unique():
-                algo_all = df[df["algorithm_name"] == algo_name]
-                algo_ok = algo_all[algo_all["status"] == "success"] if "status" in algo_all.columns else algo_all
-                total = len(algo_all)
-                ok = len(algo_ok)
-                rate = f"{ok}/{total} ({100 * ok // max(total, 1)}%)"
-
-                avg_obj = f"{algo_ok['objective_value'].mean():.1f}" if "objective_value" in algo_ok.columns and not algo_ok.empty else "—"
-                avg_rt = f"{algo_ok['wall_time_seconds'].mean():.4f}" if "wall_time_seconds" in algo_ok.columns and not algo_ok.empty else "—"
-                avg_mem = f"{algo_ok['peak_memory_mb'].mean():.1f}" if "peak_memory_mb" in algo_ok.columns and not algo_ok.empty else "—"
-
-                table_lines.append(f"| {algo_name} | {avg_obj} | {avg_rt} | {avg_mem} | {rate} |")
-
-            table_lines.append("")
-            lines.extend(table_lines)
-
-        # Error sample if any
-        if "status" in df.columns:
-            error_df = df[df["status"] != "success"]
-            if not error_df.empty:
-                for col_name in ("error_message", "error", "error_msg"):
-                    if col_name in error_df.columns:
-                        sample = error_df[col_name].dropna()
-                        sample = sample[sample.astype(str).str.strip() != ""]
-                        if not sample.empty:
-                            lines.append(f"❌ Sample error: {sample.iloc[0]}")
-                        break
-
-        msg = "\n".join(lines)
-
-        if self.state.preferred_plot_requests:
-            return msg + "\nPresent this summary table to the user EXACTLY as shown above (keep the markdown table formatting). Then generate the requested plots (call analyze_results for each item in state 'User requested plots'), then ask if they would like any other visualizations."
-        return msg + "\nPresent this summary table to the user EXACTLY as shown above (keep the markdown table formatting). Then ask: 'Would you like any plots or visualizations of these results?' Do NOT call analyze_results until the user asks."
+                sub = df[df["algorithm_name"] == algo_name]
+                success = len(sub[sub["status"] == "success"])
+                failed = len(sub) - success
+                stats.append(f"{algo_name}: {success} OK, {failed} ERR")
+                
+                if failed > 0 and error_sample is None:
+                    # Capture the first error message we find
+                    try:
+                        errors = pd.Series()
+                        if "error" in sub.columns:
+                            errors = sub[sub["status"] == "error"]["error"]
+                        elif "error_message" in sub.columns:
+                            errors = sub[sub["status"] == "error"]["error_message"]
+                        elif "error_msg" in sub.columns:
+                            errors = sub[sub["status"] == "error"]["error_msg"]
+                        
+                        if not errors.empty:
+                            error_sample = f"Error in {algo_name}: {errors.iloc[0]}"
+                    except Exception:
+                        error_sample = f"Error in {algo_name}: (Could not extract message)"
+        
+        stats_str = "; ".join(stats)
+        msg = f"✅ Benchmark complete! {len(df)} rows. ({stats_str})."
+        if error_sample:
+            msg += f"\n❌ {error_sample}"
+        return msg + "\nAsk to analyze/plot these results."
 
     def _tool_analyze_results(self, data: dict) -> str:
         if self.state.results is None:
@@ -1134,8 +936,7 @@ class OrchestratorAgent:
         if result["success"]:
             self.plot_index += 1
             if result.get("output_path") and os.path.exists(result["output_path"]):
-                self.state.last_plot_path = result["output_path"]
-                return f"✅ Plot generated and displayed to the user. File: {result['output_path']}"
+                return f"✅ Plot saved to: {result['output_path']}"
             elif result.get("message"):
                 return result["message"]
             if result.get("stdout"):
@@ -1252,14 +1053,13 @@ class OrchestratorAgent:
 
         instance_names = data.get("instance_names", [])
 
-        # List instances in suite — wait for user to choose which to load
+        # List instances in suite
         if not instance_names:
             instances = list_instances(suite_key)
             lines = [f"📋 Instances in '{suite_key}':"]
             for inst in instances:
                 lines.append(f"   • {inst['name']} ({inst.get('nodes', '?')} nodes)")
-            lines.append("")
-            lines.append("Which instances would you like to load? (Reply with names, e.g. g05_60.0, g05_80.0 — or 'all' for all.)")
+            lines.append("\nTell me which instances to load (by name).")
             return "\n".join(lines)
 
         # Fetch specific instances
